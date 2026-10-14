@@ -6,6 +6,24 @@ import com.photoguide.perception.PerceptionSnapshot
 import kotlinx.serialization.json.Json
 
 /**
+ * 一次请求实际使用的提示词快照 —— 只给调试面板用。
+ *
+ * 存在的理由：提示词是本产品最容易出事的一环（"对着空房间写台词"就是这么来的），
+ * 必须能在真机上**逐字看到实际发出去的东西**，而不是靠看代码脑补。
+ *
+ * [preview] = true 表示还没拍过照，这是按当前意图预演的，不是真实发送的内容——
+ * 必须和真实快照区分开，否则调试时会拿预演内容去解释一次真实的失败。
+ */
+data class PromptTrace(
+    val system: String,
+    val user: String,
+    val imageAttached: Boolean,
+    val model: String,
+    val maxTokens: Int,
+    val preview: Boolean,
+)
+
+/**
  * 提示词构建。
  *
  * 两条设计约束：
@@ -19,12 +37,21 @@ object CompositionPrompt {
 
     // 注意：不能用 const val —— .trimIndent() 不是编译期常量
     private val SYSTEM_PROMPT_CORE = """
-你是一位有 20 年经验的商业人像摄影师，现在在做实时拍摄指导。用户正拿着手机，
-要给一个重要的人拍照。他要的不是摄影课，是"现在马上该怎么做"。
+你是一位有 20 年经验的商业摄影师，现在在做实时拍摄指导。用户正拿着手机，
+要拍一张重要的照片。他要的不是摄影课，是"现在马上该怎么做"。
+
+你最常见的场景是**给人拍照**（本产品的主场景），但用户也可能在拍
+室内一角、食物、街景、静物、宠物——这些画面里根本没有人物。
 
 你的输出必须同时回答两件事：
 1. photographerActions —— 摄影师（拿手机的人）该做什么：机位、角度、距离、构图修正、何时按快门；
-2. modelLines —— 模特该做什么，写成一句可以直接照着念的口语。
+2. 第二栏，**按画面里有没有人物二选一**：
+   a) 有人物（含合影）→ 填 modelLines：模特该做什么，写成一句可以直接照着念的口语；
+   b) 没有人物（静物、空间、室内一角、食物、宠物、风景）→ 填 sceneNotes：
+      这个画面值得强调的要点（光线方向与色温、前中后景层次、留白、杂物规避、氛围）。
+   ⚠️ 两者**必须二选一**，另一个字段给空数组 []。
+   ⚠️ 绝对不要对着没有人的画面写"对她说"的台词，也不要写"让模特…"。
+   判断依据以画面内容为准；看不到画面时以用户的描述为准；都判断不了，默认按 a) 处理。
 
 硬性要求：
 - 每条 photographerActions 必须具体、可执行、当场能做完。
@@ -33,6 +60,9 @@ object CompositionPrompt {
 - 每条 modelLines 必须是口语，带明确方向或幅度。
   正例："头往右转一点点，看远处，别看我"、"下巴往前伸一点点，再收回来"。
   禁止书面语、禁止没有方向的"放松一点"。
+- 每条 sceneNotes 必须是针对该画面的具体动作或判断，不能是空泛的审美评价。
+  反例（禁止）："注意光线的运用"、"营造温馨氛围"。
+  正例："把台灯往左挪 10 厘米，让光从侧面扫过茶杯"、"退半步把门框带进画面右侧当边框"。
 - 如果画面已经足够好，就直接说"这样就行，按快门"，不要硬凑问题。
 - 你不确定的地方，写进 warnings，禁止编造。宁可少说，不要胡说。
 - 只输出 JSON，不要 markdown 代码块，不要任何 JSON 之外的文字。
@@ -43,7 +73,8 @@ object CompositionPrompt {
   "headline": "一句话结论，不超过 20 字",
   "score": 0-100 的整数,
   "photographerActions": ["摄影师的具体动作，2-4 条"],
-  "modelLines": ["对模特说的口语指令，1-3 条"],
+  "modelLines": ["对模特说的口语指令，1-3 条。画面里没有人时必须为 []"],
+  "sceneNotes": ["无人像画面时的强化要点，1-3 条。画面里有人物时必须为 []"],
   "issues": ["当前画面具体存在的问题，0-3 条"],
   "warnings": ["你不确定的地方，0-3 条。没有就给空数组"],
   "confidence": 0.0-1.0
@@ -66,9 +97,28 @@ object CompositionPrompt {
         imageAttached: Boolean,
     ): String = buildString {
         appendLine("【用户的拍摄意图】")
-        appendLine("- 场景：${intent.preset.displayName}。${intent.preset.guidance}")
+        val preset = intent.preset
+        if (preset != null) {
+            appendLine("- 场景：${preset.displayName}。${preset.guidance}")
+            appendLine(
+                if (preset.subjectIsPerson) {
+                    "- 本场景预设：画面里有**人物** → 第二栏用 modelLines。"
+                } else {
+                    "- 本场景预设：画面里**没有人物** → 第二栏必须用 sceneNotes，modelLines 给空数组。"
+                }
+            )
+        } else {
+            appendLine("- 用户**没有指定预设场景**（预设是可选快捷项，已被取消）。")
+            appendLine("  请不要套用任何默认场景假设，完全依据下面的补充说明判断要拍什么。")
+        }
         if (intent.freeText.isNotBlank()) {
             appendLine("- 用户补充说明：${intent.freeText.trim()}")
+            appendLine("  若描述里的主体与场景预设不符，**以用户的描述为准**；")
+            appendLine("  描述里明显没有人物时（例如\"室内温馨一角\"），第二栏用 sceneNotes。")
+        } else if (preset == null) {
+            // 既不选场景也不写字：不能默认成"人像半身"硬凑一套建议
+            appendLine("- 用户既没选场景也没写说明。请先根据画面内容判断主体是什么，再给针对性建议；")
+            appendLine("  若画面里没有可辨认的明确主体，必须在 warnings 里说明\"本次为通用指引\"。")
         }
         appendLine()
 
@@ -85,10 +135,12 @@ object CompositionPrompt {
 
         appendLine("【你可以看到什么】")
         if (imageAttached) {
-            appendLine("你可以看到用户刚拍的这张照片本身。请基于画面内容判断。")
+            appendLine("你可以看到用户刚拍的这张照片本身。请基于画面内容判断，")
+            appendLine("尤其是：**画面里到底有没有人物** —— 这决定第二栏填 modelLines 还是 sceneNotes。")
         } else {
             appendLine("你没有收到照片，你看不到画面。")
             appendLine("因此：不要编造画面里有什么人、什么背景。")
+            appendLine("第二栏只能依据上面的用户意图来判断：描述里没有人，就不要写 modelLines。")
             appendLine("你只能给通用的场景化构图建议，并且必须在 warnings 里说明")
             appendLine("\"本次未收到画面，建议为通用指引\"。")
         }

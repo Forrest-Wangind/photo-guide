@@ -13,6 +13,7 @@ import com.photoguide.perception.PerceptionSnapshot
 import com.photoguide.perception.PerceptionSource
 import com.photoguide.platform.platformLog
 import com.photoguide.prompt.CompositionPrompt
+import com.photoguide.prompt.PromptTrace
 import kotlinx.serialization.json.Json
 
 sealed interface HintOutcome {
@@ -24,12 +25,16 @@ sealed interface HintOutcome {
         val networkMs: Long,
         /** 模型原始返回，Debug 面板用；也方便排查"是不是解析错了"。 */
         val rawResponse: String,
+        /** 本次实际发出去的提示词（Debug 面板逐字展示，含失败场景）。 */
+        val prompt: PromptTrace,
     ) : HintOutcome
 
     data class Failure(
         val kind: FailureKind,
         val message: String,
         val timings: List<StageTiming>,
+        /** 失败时更要能看到发了什么——否则无法判断是提示词的问题还是服务端的问题。 */
+        val prompt: PromptTrace,
     ) : HintOutcome
 }
 
@@ -87,24 +92,44 @@ class HintEngine(private val llmClient: LlmClient) {
         )
         timer.mark("组装")
 
+        // 快照实际发出去的内容，供 Debug 面板逐字查看
+        val trace = PromptTrace(
+            system = request.systemPrompt,
+            user = request.userPrompt,
+            imageAttached = imageDataUrl != null,
+            model = config.model,
+            maxTokens = config.maxTokens,
+            preview = false,
+        )
+
         // ---- 4. 调模型 ------------------------------------------------------
         val result = llmClient.complete(request, config)
         timer.mark("模型")
 
         return when (result) {
-            is LlmResult.Ok -> HintOutcome.Success(
-                hint = parseHint(result.text),
-                timings = timer.snapshot(),
-                usage = result.usage,
-                totalMs = timer.totalMs(),
-                networkMs = result.latencyMs,
-                rawResponse = result.text,
-            )
+            is LlmResult.Ok -> {
+                val hint = parseHint(result.text)
+                HintOutcome.Success(
+                    // 输出被截断时必须显式标注（设计原则 3）——即使 JSON 碰巧解析成功，
+                    // 内容也可能是半截的，不能装作一切正常
+                    hint = if (result.truncated) hint.copy(
+                        warnings = hint.warnings +
+                            "输出被 max_tokens 截断，内容可能不完整；请到设置里调大 max_tokens",
+                    ) else hint,
+                    timings = timer.snapshot(),
+                    usage = result.usage,
+                    totalMs = timer.totalMs(),
+                    networkMs = result.latencyMs,
+                    rawResponse = result.text,
+                    prompt = trace,
+                )
+            }
 
             is LlmResult.Failure -> HintOutcome.Failure(
                 kind = result.kind,
                 message = result.message,
                 timings = timer.snapshot(),
+                prompt = trace,
             )
         }
     }

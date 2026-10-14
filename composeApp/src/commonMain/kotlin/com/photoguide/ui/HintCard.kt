@@ -2,6 +2,7 @@ package com.photoguide.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,14 +19,11 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -36,23 +34,30 @@ import com.photoguide.decision.CompositionHint
  * 双栏提示卡 —— 本产品的差异化点。
  *
  * 左栏：摄影师（拿手机的人）该做的动作。
- * 右栏：模特该做什么，写成可以**直接照着念**的话。
+ * 右栏**按画面里有没有人物切换**：
+ *  - 有人物 → 「对她说」：写成可以**直接照着念**的话（本产品的核心差异）；
+ *  - 无人像 → 「画面要点」：拍室内一角/食物/静物时，硬凑"对她说"就是胡说。
  *
  * 空间约束（拍摄场景下取景器必须可见）：
- * - 默认**收起**：只显示标题 + 首条"对她说"台词（拍摄瞬间最有用的是这句话）。
+ * - 默认**收起**：只显示标题 + 右侧首条内容（拍摄瞬间最有用的是那句话）。
  * - 展开：完整双栏，整体限高并可滚动，绝不吞掉整个屏幕。
- * - 右上角 ✕ 直接关掉卡片。
+ * - 右上角 ✕ 直接关掉卡片；点击卡片外的空白区由上层收起/关闭。
+ *
+ * 展开态由外部受控（[expanded] / [onExpandedChange]）—— 因为"点空白收起"
+ * 需要父层知道当前是展开还是已收起，才能决定这一次点是收起还是关掉。
  */
 @Composable
 fun HintCard(
     hint: CompositionHint,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var expanded by remember(hint) { mutableStateOf(false) }
-
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            // 吞掉卡片区域内的点击：点正文空白不该被当成"点空白处收起"
+            .pointerInput(Unit) { detectTapGestures { } }
             .clip(RoundedCornerShape(16.dp))
             .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.96f))
             .padding(horizontal = 14.dp, vertical = 10.dp),
@@ -87,6 +92,7 @@ fun HintCard(
 
             val hasDetail = hint.photographerActions.isNotEmpty() ||
                 hint.modelLines.size > 1 ||
+                hint.sceneNotes.size > 1 ||
                 hint.issues.isNotEmpty()
             if (hasDetail) {
                 Text(
@@ -95,7 +101,7 @@ fun HintCard(
                     fontSize = 13.sp,
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier
-                        .clickable { expanded = !expanded }
+                        .clickable { onExpandedChange(!expanded) }
                         .padding(horizontal = 8.dp, vertical = 4.dp),
                 )
             }
@@ -131,14 +137,35 @@ fun HintCard(
                         lines = hint.photographerActions,
                         emptyText = "无需调整机位",
                     )
+                    // 第二栏标题跟着内容走：画面里有人才是"对她说"，
+                    // 拍室内一角/食物/静物时硬写"对她说"就是胡说
                     HintColumn(
                         modifier = Modifier.weight(1f),
-                        title = "对她说",
+                        title = if (hint.hasPerson) "对她说" else "画面要点",
                         accent = MaterialTheme.colorScheme.primary,
-                        lines = hint.modelLines,
-                        emptyText = "不用开口",
-                        quote = true,
+                        lines = hint.secondColumnLines,
+                        emptyText = if (hint.hasPerson) "不用开口" else "无需额外强调",
+                        quote = hint.hasPerson,
                     )
+                }
+
+                // 模型两种都给（罕见但可能）：都展示，不静默丢掉任何一段
+                if (hint.hasPerson && hint.sceneNotes.isNotEmpty()) {
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        text = "画面要点",
+                        color = MaterialTheme.colorScheme.primary,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    hint.sceneNotes.forEach { note ->
+                        Text(
+                            text = "· $note",
+                            color = MaterialTheme.colorScheme.onSurface,
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
+                    }
                 }
 
                 if (hint.issues.isNotEmpty()) {
@@ -186,17 +213,19 @@ fun HintCard(
     }
 }
 
-/** 收起态：一行最有用的台词 + 概要计数。轻到不挡取景。 */
+/** 收起态：一行最有用的内容 + 概要计数。轻到不挡取景。 */
 @Composable
 private fun CollapsedBody(hint: CompositionHint) {
-    val modelLine = hint.modelLines.firstOrNull { it.isNotBlank() }
+    // 有人物 → 优先露台词（拍摄瞬间要念的那句）；
+    // 无人像 → 露第二条栏的首条要点，没有就退回摄影师动作
+    val second = hint.secondColumnLines.firstOrNull { it.isNotBlank() }
     val fallback = hint.photographerActions.firstOrNull { it.isNotBlank() }
-    val preview = modelLine ?: fallback
+    val preview = second ?: fallback
 
     if (preview != null) {
         Spacer(Modifier.height(6.dp))
         Text(
-            text = if (modelLine != null) "\u201C$preview\u201D" else "· $preview",
+            text = if (second != null && hint.hasPerson) "\u201C$preview\u201D" else "· $preview",
             color = MaterialTheme.colorScheme.onSurface,
             fontSize = 14.sp,
             maxLines = 1,
@@ -205,7 +234,11 @@ private fun CollapsedBody(hint: CompositionHint) {
     }
     val extra = buildList {
         if (hint.photographerActions.isNotEmpty()) add("机位 ${hint.photographerActions.size} 条")
-        if (hint.modelLines.size > 1) add("台词 ${hint.modelLines.size} 句")
+        if (hint.hasPerson) {
+            if (hint.modelLines.size > 1) add("台词 ${hint.modelLines.size} 句")
+        } else if (hint.sceneNotes.isNotEmpty()) {
+            add("要点 ${hint.sceneNotes.size} 条")
+        }
         if (hint.issues.isNotEmpty()) add("问题 ${hint.issues.size} 项")
         if (hint.warnings.isNotEmpty()) add("注意 ${hint.warnings.size} 条")
     }

@@ -37,7 +37,7 @@ import com.photoguide.state.AppState
 /**
  * 设置页。
  *
- * 远端大模型完全可配置：provider / baseUrl / model / key / 温度 / 是否传图。
+ * 远端大模型完全可配置：provider / baseUrl / model / key / 随机性(temperature) / 是否传图。
  * 默认走 DeepSeek 的视觉模型，但换任何 OpenAI 兼容端点都只需要改这几个字段，
  * 不用改一行代码。
  */
@@ -178,11 +178,13 @@ fun SettingsScreen(state: AppState) {
         Spacer(Modifier.height(10.dp))
 
         SliderRow(
-            label = "温度 temperature",
+            // 不写"温度"：拍照类产品里"温度"第一反应是色温，这里是模型的采样随机性
+            label = "随机性 temperature",
             value = config.temperature.toFloat(),
             // 不要用 String.format：那是 JVM-only，commonMain 里编不过
             valueText = (((config.temperature * 10).toInt()).toDouble() / 10.0).toString(),
             range = 0f..1.5f,
+            hint = "越高回答越发散、说法越多样；越低越稳定保守、每次都差不多。拍摄建议 0.5~0.8 最稳。",
             onChange = { state.updateConfig(config.copy(temperature = it.toDouble())) },
         )
 
@@ -190,7 +192,8 @@ fun SettingsScreen(state: AppState) {
             label = "max_tokens",
             value = config.maxTokens.toFloat(),
             valueText = "${config.maxTokens}",
-            range = 200f..2000f,
+            // 带思考的模型会把推理 token 也算进输出预算，给足余量
+            range = 200f..8192f,
             onChange = { state.updateConfig(config.copy(maxTokens = it.toInt())) },
         )
 
@@ -306,6 +309,7 @@ private fun SliderRow(
     valueText: String,
     range: ClosedFloatingPointRange<Float>,
     onChange: (Float) -> Unit,
+    hint: String? = null,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
         Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
@@ -313,5 +317,13 @@ private fun SliderRow(
             Text(valueText, color = MaterialTheme.colorScheme.primary, fontSize = 12.sp)
         }
         Slider(value = value, onValueChange = onChange, valueRange = range)
+        if (hint != null) {
+            Text(
+                text = hint,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 2.dp, bottom = 4.dp),
+            )
+        }
     }
 }

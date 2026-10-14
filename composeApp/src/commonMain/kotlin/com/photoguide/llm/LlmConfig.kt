@@ -19,8 +19,21 @@ data class LlmConfig(
     val baseUrl: String = "https://api.deepseek.com",
     val model: String = "deepseek-v4-flash-vision-exp",
     val apiKey: String = "",
+    /**
+     * 采样随机性。UI 上叫「随机性」，**不要翻成"温度"**——
+     * 拍照类产品里"温度"第一反应是色温，会把人带偏。
+     * 0.6 兼顾稳定（建议不飘）与表达多样（台词不重复）。
+     */
     val temperature: Double = 0.6,
-    val maxTokens: Int = 900,
+
+    /**
+     * 单次回复的输出上限。
+     *
+     * ⚠️ 不能设太小（如 900）：带思考的模型会把推理 token 也算进 max_tokens，
+     * 思考没结束正文就被截断，表现为 finish_reason=length 且 content 为空。
+     * 结构化 JSON 输出（双栏 + 要点 + 问题 + 警告）留足 4096 才稳。
+     */
+    val maxTokens: Int = DEFAULT_MAX_TOKENS,
     val timeoutMs: Long = 60_000,
 
     /** 是否把照片一起上传。关掉后会退化成"纯文本也能用"的形态（但拿不到审美判断）。 */
@@ -39,4 +52,15 @@ data class LlmConfig(
         get() = apiKey.isNotBlank() && baseUrl.isNotBlank() && model.isNotBlank()
 
     val endpoint: String get() = baseUrl.trimEnd('/') + "/chat/completions"
+
+    companion object {
+        /** 当前默认输出上限。 */
+        const val DEFAULT_MAX_TOKENS = 4096
+
+        /** 旧版默认值：已持久化配置里若仍是它，加载时会被提升（见 AppState.loadConfig）。 */
+        const val LEGACY_MAX_TOKENS = 900
+
+        /** 持久化配置的输出上限下限——低于它视为旧默认残留，不足以容纳思考 + JSON 正文。 */
+        const val MIN_VALID_MAX_TOKENS = 2048
+    }
 }

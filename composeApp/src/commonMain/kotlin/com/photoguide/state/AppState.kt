@@ -17,11 +17,14 @@ import com.photoguide.llm.LlmConfig
 import com.photoguide.metrics.LatencyTrend
 import com.photoguide.metrics.StageTiming
 import com.photoguide.perception.NoPerception
+import com.photoguide.perception.PerceptionSnapshot
 import com.photoguide.perception.PerceptionSource
 import com.photoguide.perception.PerceptionRegistry
 import com.photoguide.platform.SettingsStore
 import com.photoguide.platform.createSettingsStore
 import com.photoguide.platform.platformLog
+import com.photoguide.prompt.CompositionPrompt
+import com.photoguide.prompt.PromptTrace
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -75,6 +78,10 @@ class AppState(
     var rawResponse by mutableStateOf<String?>(null)
         private set
 
+    /** 最近一次请求**实际发送**的提示词（失败时也有）。调试面板逐字展示。 */
+    var lastPrompt by mutableStateOf<PromptTrace?>(null)
+        private set
+
     var showSettings by mutableStateOf(false)
         private set
 
@@ -89,11 +96,21 @@ class AppState(
 
     private fun loadConfig(): LlmConfig {
         val stored = settings.getString(KEY_CONFIG) ?: return LlmConfig()
-        return runCatching { json.decodeFromString(LlmConfig.serializer(), stored) }
+        val decoded = runCatching { json.decodeFromString(LlmConfig.serializer(), stored) }
             .getOrElse {
                 platformLog(TAG, "配置反序列化失败，回退默认值：${it.message}")
-                LlmConfig()
+                return LlmConfig()
             }
+
+        // 迁移：旧版默认 maxTokens=900 会被带思考的模型整个吃在推理阶段，
+        // 正文为空（finish_reason=length）。低于下限的存量配置提升到新版默认并落盘。
+        if (decoded.maxTokens < LlmConfig.MIN_VALID_MAX_TOKENS) {
+            val fixed = decoded.copy(maxTokens = LlmConfig.DEFAULT_MAX_TOKENS)
+            platformLog(TAG, "迁移：maxTokens=${decoded.maxTokens} 过小，提升为 ${fixed.maxTokens}")
+            settings.putString(KEY_CONFIG, json.encodeToString(LlmConfig.serializer(), fixed))
+            return fixed
+        }
+        return decoded
     }
 
     fun updateConfig(new: LlmConfig) {
@@ -112,6 +129,30 @@ class AppState(
     }
 
     fun currentPerception(): PerceptionSource = PerceptionRegistry.byId(perceptionId)
+
+    /**
+     * 调试用：还没拍过照时，按当前意图**预演**一份提示词。
+     *
+     * 这样改完预设/描述就能立刻在调试面板里看到提示词长什么样，
+     * 不用先花一次真实请求。返回的 trace 带 `preview = true`，
+     * 面板会明确标注"这不是实际发送内容"——不把预演和真实快照混为一谈。
+     */
+    fun previewPrompt(): PromptTrace = PromptTrace(
+        system = CompositionPrompt.buildSystemPrompt(config),
+        user = CompositionPrompt.buildUserPrompt(
+            intent = intent,
+            perception = PerceptionSnapshot(
+                source = perceptionId,
+                notes = listOf("预览：尚未拍摄，无本地感知数据"),
+            ),
+            config = config,
+            imageAttached = config.sendImage,
+        ),
+        imageAttached = config.sendImage,
+        model = config.model,
+        maxTokens = config.maxTokens,
+        preview = true,
+    )
 
     // ---------------------------------------------------------------- 分析
 
@@ -145,6 +186,7 @@ class AppState(
                     hint = outcome.hint
                     timings = outcome.timings
                     rawResponse = outcome.rawResponse
+                    lastPrompt = outcome.prompt
                     trend.add(outcome.totalMs)
                     phase = AnalysisPhase.DONE
                     platformLog(
@@ -157,6 +199,7 @@ class AppState(
                 is HintOutcome.Failure -> {
                     failure = FailureInfo(outcome.kind, outcome.message)
                     timings = outcome.timings
+                    lastPrompt = outcome.prompt
                     phase = AnalysisPhase.FAILED
                     platformLog(TAG, "失败[${outcome.kind}]：${outcome.message}")
                 }

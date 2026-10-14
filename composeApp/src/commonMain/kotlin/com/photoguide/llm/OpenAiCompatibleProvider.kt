@@ -114,6 +114,7 @@ class OpenAiCompatibleProvider(
                 text = text,
                 usage = parsed.usage?.let { LlmUsage(it.promptTokens, it.completionTokens) },
                 latencyMs = latency,
+                truncated = parsed.choices.firstOrNull()?.finishReason == "length",
             )
         } catch (e: TimeoutCancellationException) {
             LlmResult.Failure(FailureKind.TIMEOUT, "本地等待超时（${config.timeoutMs} ms）")

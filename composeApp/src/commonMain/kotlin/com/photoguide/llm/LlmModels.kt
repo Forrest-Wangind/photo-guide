@@ -32,6 +32,8 @@ sealed interface LlmResult {
         val text: String,
         val usage: LlmUsage?,
         val latencyMs: Long,
+        /** finish_reason=length：输出被 max_tokens 截断。上层必须显式告知用户，不许装没事。 */
+        val truncated: Boolean = false,
     ) : LlmResult
 
     data class Failure(

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      刻意继承 framework 的 Material 主题，而不是 AppCompat/Material3 库主题：
+      Compose 自己管全部 UI，Activity 只需要一个"深色背景、无 ActionBar"的壳，
+      这样就不必为了主题再引一个 Android View 体系的大依赖。
+    -->
+    <style name="Theme.PhotoGuide" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#0E0E11</item>
+        <item name="android:statusBarColor">#0E0E11</item>
+        <item name="android:navigationBarColor">#0E0E11</item>
+    </style>
+</resources>

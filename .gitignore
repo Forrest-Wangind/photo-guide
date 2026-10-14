@@ -1,0 +1,22 @@
+.gradle/
+build/
+*/build/
+local.properties
+.idea/
+*.iml
+.kotlin/
+captures/
+.DS_Store
+
+# iOS
+iosApp/Pods/
+iosApp/*.xcworkspace/xcuserdata/
+iosApp/*.xcodeproj/xcuserdata/
+*.hprof
+
+# 不提交密钥
+secrets.properties
+
+# WorkBuddy 工作区本地数据（会话记忆等仅存本机，不参与版本管理）
+.workbuddy/*
+!.workbuddy/skills/

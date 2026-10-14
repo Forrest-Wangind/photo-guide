@@ -152,8 +152,8 @@ kotlin-stdlib 版本**后取上界得出的：
 | Ktor | **3.5.2** | 2.3.21 |
 | kotlinx-serialization | **1.10.0** | 2.3.0 |
 | kotlinx-coroutines | **1.11.0** | 2.2.20 |
-| AGP | **8.13.0** | 本机缓存已有 |
-| Gradle | **8.13** | 本机缓存已有（免下载） |
+| AGP | **8.11.1** | 受 Android Studio 版本上限约束（见下） |
+| Gradle | **8.13** | AGP 8.11 要求 >= 8.13；本机缓存已有 |
 | CameraX | **1.5.3** | — |
 | compileSdk / minSdk / targetSdk | 36 / 26 / 36 | 本机已装 android-36 |
 
@@ -161,15 +161,38 @@ kotlin-stdlib 版本**后取上界得出的：
 `compileSdk 37`，而本机只装到 36；且 AGP 需要 9.x。为了"能在本机真的构建出来"，
 选了 1.11.1 这条线。**升级是一个独立动作，不该和开工混在一起。**
 
+**为什么 AGP 是 8.11.1 而不是 8.13.0**：这与上游库无关，纯粹被 **Android Studio
+的兼容上界**卡住。AS 2025.1.1（Narwhal）官方只支持 **AGP 3.2~8.11**，用 8.13.0
+会在 Sync 阶段被 IDE 直接拒绝，报
+`The project is using an incompatible version (AGP 8.13.0) ... Latest supported version is AGP 8.11.1`。
+
+各版本的上界（来源：https://developer.android.com/build/releases/about-agp ）：
+
+| Android Studio | 支持的 AGP 上界 |
+|---|---|
+| 2025.1.1 Narwhal | **8.11** |
+| 2025.1.2 Narwhal Feature Drop | 8.12 |
+| 2025.1.3 Narwhal 3 Feature Drop | 8.13 |
+| 2025.2.1 Otter | 8.13 |
+
+取 **8.11.1** 而非已发布的 8.11.2，因为 AS 的版本检查就是按 8.11.1 这个上界判定的。
+GitHub Actions / CI 上的命令行构建不受此限制（Gradle 不检查 IDE 版本），
+所以这个约束只在"用 AS 打开"时生效。
+
+**升到 AGP 8.13 的前提**：把 AS 升到 2025.1.3（Narwhal 3 Feature Drop）或更高。
+这是独立动作，且对本项目**没有功能收益**——`composeApp/build.gradle.kts` 只用了
+最基础的 `android { }` 配置块，8.11 与 8.13 在编译结果上无差异。
+
 ---
 
-## 6. 踩到的三个坑（都已修，记在这里省下次的时间）
+## 6. 踩到的四个坑（都已修，记在这里省下次的时间）
 
 | # | 现象 | 原因 | 修法 |
 |---|---|---|---|
 | 1 | `Unresolved reference: camerax` | 版本目录别名 `camerax-core` 的访问器是 `libs.camerax.core`，我写成了 `libs.androidx.camerax.core` | 别名统一改为 `androidx-camerax-*` |
 | 2 | `Const 'val' initializer must be a constant value` | `const val X = """…""".trimIndent()` —— `trimIndent()` 不是编译期常量 | 改成 `private val` |
 | 3 | `Platform declaration clash: setIntent(...)` | `var intent` 自动生成的 JVM setter 与我手写的 `fun setIntent()` 签名相同 | 方法改名 `updateIntent` / `selectPerception` |
+| 4 | AS 打开项目报 `incompatible version (AGP 8.13.0) ... Latest supported version is AGP 8.11.1`，Sync 被拒（命令行 `gradlew assembleDebug` 却完全正常） | AS 对 AGP 有**独立的兼容上界**，与 Gradle 无关。AS 2025.1.1 只到 AGP 8.11 | `libs.versions.toml` 里 `agp = "8.11.1"`；已在 AGP 8.11.1 下重新 `assembleDebug` 验证通过 |
 
 ---
 

@@ -134,7 +134,7 @@ fun CameraScreen(state: AppState) {
                     .padding(bottom = 190.dp, start = 12.dp, end = 12.dp)
                     .fillMaxWidth()
             ) {
-                HintCard(hint = hint)
+                HintCard(hint = hint, onDismiss = state::dismissHint)
             }
         }
 

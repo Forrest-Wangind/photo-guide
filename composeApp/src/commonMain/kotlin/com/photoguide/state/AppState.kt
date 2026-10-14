@@ -173,6 +173,12 @@ class AppState(
         if (phase == AnalysisPhase.FAILED) phase = AnalysisPhase.IDLE
     }
 
+    /** 用户主动关掉提示卡。下一次按快门会重新生成。 */
+    fun dismissHint() {
+        hint = null
+        if (phase == AnalysisPhase.DONE) phase = AnalysisPhase.IDLE
+    }
+
     fun openSettings() { showSettings = true }
     fun closeSettings() { showSettings = false }
     fun toggleDebug() { showDebug = !showDebug }

@@ -50,7 +50,7 @@ AVFoundation，**帧通路不必绕一层自有插件桥**；而调参代码能�
 | Compose Multiplatform | 1.11.1 | 不用 1.12.x：它要求 compileSdk 37 |
 | Ktor | 3.5.2 | HTTP 客户端（Android=OkHttp / iOS=Darwin） |
 | kotlinx-serialization | 1.10.0 | JSON |
-| AGP / Gradle | 8.13.0 / 8.13 | 本机缓存已有，免下载 |
+| AGP / Gradle | 8.11.1 / 8.13 | AGP 受 Android Studio 版本上限约束（见下） |
 | CameraX | 1.5.3 | Android 采集 |
 | compileSdk / minSdk / targetSdk | 36 / 26 / 36 | Android 8.0+ |
 

@@ -1,6 +1,7 @@
 package com.photoguide.decision
 
 import com.photoguide.capture.CapturedPhoto
+import com.photoguide.llm.Endpoint
 import com.photoguide.llm.FailureKind
 import com.photoguide.llm.LlmClient
 import com.photoguide.llm.LlmConfig
@@ -62,6 +63,8 @@ class HintEngine(private val llmClient: LlmClient) {
         intent: ShootingIntent,
         perception: PerceptionSource,
         config: LlmConfig,
+        /** 本次实际要用的端点（三元组 + 协议族）。不再是 config 的一坨字段。 */
+        endpoint: Endpoint,
     ): HintOutcome {
         val timer = StageTimer()
 
@@ -97,13 +100,13 @@ class HintEngine(private val llmClient: LlmClient) {
             system = request.systemPrompt,
             user = request.userPrompt,
             imageAttached = imageDataUrl != null,
-            model = config.model,
+            model = endpoint.model,
             maxTokens = config.maxTokens,
             preview = false,
         )
 
         // ---- 4. 调模型 ------------------------------------------------------
-        val result = llmClient.complete(request, config)
+        val result = llmClient.complete(request, config, endpoint)
         timer.mark("模型")
 
         return when (result) {

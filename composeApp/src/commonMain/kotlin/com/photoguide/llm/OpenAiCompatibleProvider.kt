@@ -52,11 +52,12 @@ class OpenAiCompatibleProvider(
         explicitNulls = false
     }
 
-    override suspend fun complete(request: LlmRequest, config: LlmConfig): LlmResult {
-        if (!config.isConfigured) {
+    override suspend fun complete(request: LlmRequest, config: LlmConfig, endpoint: Endpoint): LlmResult {
+        if (!endpoint.isUsable) {
             return LlmResult.Failure(
                 FailureKind.NOT_CONFIGURED,
-                "还没配置 API Key / Base URL / 模型名，去设置页填一下",
+                "端点「${endpoint.displayName}」还没填全：Base URL / 模型名 / API Key，" +
+                    "去设置页补一下",
             )
         }
 
@@ -67,7 +68,7 @@ class OpenAiCompatibleProvider(
         var attempt = 0
         while (true) {
             attempt++
-            val result = attemptOnce(request, config)
+            val result = attemptOnce(request, config, endpoint)
             if (result is LlmResult.Ok) return result
             val failure = result as LlmResult.Failure
             val retryable = failure.kind == FailureKind.NETWORK || failure.kind == FailureKind.BAD_RESPONSE
@@ -83,17 +84,18 @@ class OpenAiCompatibleProvider(
     private suspend fun attemptOnce(
         request: LlmRequest,
         config: LlmConfig,
-        endpoint: String = config.endpoint,
+        endpoint: Endpoint,
+        url: String = endpoint.chatCompletionsUrl,
     ): LlmResult {
         val started = Clock.nowMs()
         return try {
-            val body = buildRequestBody(request, config)
+            val body = buildRequestBody(request, config, endpoint)
             // 请求侧落日志：端点 / 模型 / 是否带图 / 体积。只打大小不打内容——
             // body 里是 base64 图片，全打会把 logcat 撑爆
             val bodyChars = json.encodeToString(JsonObject.serializer(), body).length
             platformLog(
                 TAG,
-                "POST ${config.endpoint} · model=${config.model.trim()} · " +
+                "POST $url · endpoint=${endpoint.displayName} · model=${endpoint.model.trim()} · " +
                     "image=${request.imageDataUrl != null} · body≈${bodyChars / 1024}KB",
             )
 
@@ -101,8 +103,8 @@ class OpenAiCompatibleProvider(
             // 连接中途断开时走到下面的分类（NETWORK，可重试），
             // 而不是被 runCatching 吞成空字符串、伪装成"返回不是合法 JSON"
             val (response, raw) = withTimeout(config.timeoutMs) {
-                val resp = client.post(endpoint) {
-                    header("Authorization", "Bearer ${config.apiKey.trim()}")
+                val resp = client.post(url) {
+                    header("Authorization", "Bearer ${endpoint.apiKey.trim()}")
                     header("Accept", "application/json")
                     contentType(ContentType.Application.Json)
                     setBody(body)
@@ -134,19 +136,20 @@ class OpenAiCompatibleProvider(
             val parsed = runCatching { json.decodeFromString<ChatResponse>(raw) }.getOrNull()
             if (parsed == null) {
                 val trimmed = raw.trimStart()
-                if (trimmed.startsWith("<") && !endpoint.contains("/v1/")) {
+                if (trimmed.startsWith("<") && !url.contains("/v1/")) {
                     // 返回的是网页而非 API 结果——最典型原因是 Base URL 少了 /v1：
                     // 网关（New API / One-API 系）对未知路径会 SPA 兜底返回首页 HTML，
                     // HTTP 200 + HTML，用户侧表现为"服务端返回不是合法 JSON"。
-                    // 自动补 /v1 重试一次（altEndpoint 已含 /v1/，不会二次进入本分支），
+                    // 自动补 /v1 重试一次（altUrl 已含 /v1/，不会二次进入本分支），
                     // 成功则提示用户把 Base URL 改对，一劳永逸
-                    val altEndpoint = config.baseUrl.trimEnd('/') + "/v1/chat/completions"
-                    platformLog(TAG, "返回的是 HTML 网页——Base URL 疑似缺少 /v1，自动改用 $altEndpoint 重试")
-                    val retried = attemptOnce(request, config, altEndpoint)
+                    val altUrl = endpoint.baseUrl.trimEnd('/') + "/v1/chat/completions"
+                    platformLog(TAG, "返回的是 HTML 网页——Base URL 疑似缺少 /v1，自动改用 $altUrl 重试")
+                    val retried = attemptOnce(request, config, endpoint, altUrl)
                     if (retried is LlmResult.Ok) {
                         platformLog(
                             TAG,
-                            "补 /v1 后请求成功。请在设置里把 Base URL 改为 \"${config.baseUrl.trimEnd('/')}/v1\"",
+                            "补 /v1 后请求成功。请在设置里把端点「${endpoint.displayName}」的 Base URL " +
+                                "改为 \"${endpoint.baseUrl.trimEnd('/')}/v1\"",
                         )
                     }
                     return retried
@@ -202,7 +205,7 @@ class OpenAiCompatibleProvider(
         }
     }
 
-    private fun buildRequestBody(request: LlmRequest, config: LlmConfig): JsonObject {
+    private fun buildRequestBody(request: LlmRequest, config: LlmConfig, endpoint: Endpoint): JsonObject {
         val userContent: JsonArray = buildJsonArray {
             addJsonObject {
                 put("type", "text")
@@ -235,7 +238,7 @@ class OpenAiCompatibleProvider(
         }
 
         return buildJsonObject {
-            put("model", config.model.trim())
+            put("model", endpoint.model.trim())
             put("temperature", effectiveTemp)
             put("max_tokens", config.maxTokens)
             put("stream", false)

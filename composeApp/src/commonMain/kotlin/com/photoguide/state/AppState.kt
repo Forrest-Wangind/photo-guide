@@ -11,11 +11,11 @@ import com.photoguide.decision.CompositionHint
 import com.photoguide.decision.HintEngine
 import com.photoguide.decision.HintOutcome
 import com.photoguide.decision.ShootingIntent
+import com.photoguide.llm.Endpoint
 import com.photoguide.llm.FailureKind
 import com.photoguide.llm.LlmClient
 import com.photoguide.llm.LlmConfig
 import com.photoguide.llm.ProviderCatalog
-import com.photoguide.llm.SavedEndpoint
 import com.photoguide.metrics.LatencyTrend
 import com.photoguide.metrics.StageTiming
 import com.photoguide.perception.NoPerception
@@ -30,7 +30,10 @@ import com.photoguide.prompt.PromptTrace
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.MapSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 
 enum class AnalysisPhase { IDLE, ANALYZING, DONE, FAILED }
@@ -54,12 +57,25 @@ class AppState(
     private val engine = HintEngine(llmClient)
     private val json = Json { ignoreUnknownKeys = true; isLenient = true; explicitNulls = false }
 
+    // ⚠️ 声明顺序有讲究：endpoints 必须在 config 之前。
+    // Kotlin 按声明顺序初始化属性，而 loadConfig() 要拿 endpoints 校验 activeEndpointId。
+
+    /**
+     * 端点列表 —— 模型服务层**唯一**的真相源。
+     *
+     * 内置两条（DeepSeek / Claude）+ 用户新建的都在这里；输入框直接编辑当前选中的一条，
+     * 改一次落盘一次。不再有"预设槽位快照 + 已保存端点列表 + config 三元组"三份并存——
+     * 那份冗余正是 2026-10-15 两个 bug（改了没保存 / 切走再切回丢手改）的来源。
+     */
+    var endpoints by mutableStateOf(loadEndpoints())
+        private set
+
     var config by mutableStateOf(loadConfig())
         private set
 
-    /** 用户保存的自定义端点列表，落盘持久化，重启不丢。 */
-    var savedEndpoints by mutableStateOf(loadEndpoints())
-        private set
+    /** 当前生效端点。列表保证非空（内置端点会被补齐），这里的 `first()` 只是兜底。 */
+    val activeEndpoint: Endpoint
+        get() = endpoints.firstOrNull { it.id == config.activeEndpointId } ?: endpoints.first()
 
     var intent by mutableStateOf(ShootingIntent())
         private set
@@ -102,22 +118,65 @@ class AppState(
     // ---------------------------------------------------------------- 配置
 
     private fun loadConfig(): LlmConfig {
-        val stored = settings.getString(KEY_CONFIG) ?: return LlmConfig()
+        val stored = settings.getString(KEY_CONFIG)
+            ?: return LlmConfig(activeEndpointId = endpoints.first().id)
+
+        // 老格式（2026-10-15 之前）把三元组直接存在 config 里，新格式只存 activeEndpointId。
+        // 用 providerId 是否存在判定格式——新 LlmConfig 没有这个字段，老 JSON 里才有。
+        val legacy = runCatching { json.decodeFromString(LegacyLlmConfig.serializer(), stored) }.getOrNull()
+        val isLegacyFormat = legacy?.providerId != null
+
         val decoded = runCatching { json.decodeFromString(LlmConfig.serializer(), stored) }
             .getOrElse {
                 platformLog(TAG, "配置反序列化失败，回退默认值：${it.message}")
-                return LlmConfig()
+                return LlmConfig(activeEndpointId = endpoints.first().id)
             }
+
+        var fixed = decoded.copy(
+            // 老格式里的 activeEndpointId 只是默认值（库里根本没这字段），必须忽略，
+            // 否则"用户正在用某个自定义端点"这个状态会在升级那一刻丢给 DeepSeek
+            activeEndpointId = resolveActiveEndpointId(
+                newId = if (isLegacyFormat) null else decoded.activeEndpointId,
+                legacy = legacy,
+            ),
+        )
 
         // 迁移：旧版默认 maxTokens=900 会被带思考的模型整个吃在推理阶段，
         // 正文为空（finish_reason=length）。低于下限的存量配置提升到新版默认并落盘。
-        if (decoded.maxTokens < LlmConfig.MIN_VALID_MAX_TOKENS) {
-            val fixed = decoded.copy(maxTokens = LlmConfig.DEFAULT_MAX_TOKENS)
-            platformLog(TAG, "迁移：maxTokens=${decoded.maxTokens} 过小，提升为 ${fixed.maxTokens}")
-            settings.putString(KEY_CONFIG, json.encodeToString(LlmConfig.serializer(), fixed))
-            return fixed
+        if (fixed.maxTokens < LlmConfig.MIN_VALID_MAX_TOKENS) {
+            platformLog(TAG, "迁移：maxTokens=${fixed.maxTokens} 过小，提升为 ${LlmConfig.DEFAULT_MAX_TOKENS}")
+            fixed = fixed.copy(maxTokens = LlmConfig.DEFAULT_MAX_TOKENS)
         }
-        return decoded
+
+        // 校验/迁移结果立刻落盘：老格式被重写成新格式，下一次启动直接命中新格式
+        settings.putString(KEY_CONFIG, json.encodeToString(LlmConfig.serializer(), fixed))
+        if (isLegacyFormat) {
+            platformLog(TAG, "配置已迁移到端点模型：activeEndpointId=${fixed.activeEndpointId}")
+        }
+        return fixed
+    }
+
+    /**
+     * 解析"当前该用哪个端点"。
+     *
+     * 三级回落，一级都不能少 —— 升级路径上这三种存量数据都存在：
+     *   1. 新格式：直接给了 id；
+     *   2. 老格式的 providerId 正好与端点 id 同名（deepseek / claude）；
+     *   3. 老格式的其他 providerId（`saved:url|model`、`openai-compatible`）：
+     *      按三元组匹配迁移后的端点 —— 这正是"升级前正在用某个自定义端点"的场景。
+     */
+    private fun resolveActiveEndpointId(newId: String?, legacy: LegacyLlmConfig?): String {
+        if (newId != null && endpoints.any { it.id == newId }) return newId
+
+        val pid = legacy?.providerId
+        if (pid != null && endpoints.any { it.id == pid }) return pid
+
+        val lUrl = legacy?.baseUrl
+        val lModel = legacy?.model
+        if (!lUrl.isNullOrBlank() && !lModel.isNullOrBlank()) {
+            endpoints.firstOrNull { it.baseUrl == lUrl && it.model == lModel }?.let { return it.id }
+        }
+        return endpoints.first().id
     }
 
     fun updateConfig(new: LlmConfig) {
@@ -125,89 +184,269 @@ class AppState(
         settings.putString(KEY_CONFIG, json.encodeToString(LlmConfig.serializer(), new))
     }
 
-    // ------------------------------------------------ 自定义端点列表
+    // ------------------------------------------------ 端点列表（唯一真相源）
 
     // ⚠️ 序列化器必须在方法内现场创建，不能做成类成员属性：
-    // loadEndpoints() 在 `var savedEndpoints by mutableStateOf(...)` 的初始化阶段就被调用，
-    // 若 endpointListSerializer 声明在类体更靠后的位置，那一刻它还是 null，
+    // loadEndpoints() 在 `var endpoints by mutableStateOf(...)` 的初始化阶段就被调用，
+    // 若序列化器声明在类体更靠后的位置，那一刻它还是 null，
     // decodeFromString 收到 null 直接抛异常 → 列表每次启动都被打回空，
     // 表现为"保存过的端点重启就丢"（2026-10-15 实锤，logcat 可见 parameter deserializer is null）
-    private fun loadEndpoints(): List<SavedEndpoint> {
-        val stored = settings.getString(KEY_ENDPOINTS) ?: return emptyList()
-        return runCatching { json.decodeFromString(ListSerializer(SavedEndpoint.serializer()), stored) }
-            // 旧版本存的数据没有 id：按确定性规则补齐，与 saveCurrentEndpoint 一致
-            .map { list ->
-                list.map { ep ->
-                    if (ep.id.isBlank()) ep.copy(id = SavedEndpoint.keyFor(ep.baseUrl, ep.model)) else ep
+    private fun loadEndpoints(): List<Endpoint> {
+        val stored = settings.getString(KEY_ENDPOINTS)
+        if (stored != null) {
+            val decoded = runCatching { json.decodeFromString(ListSerializer(Endpoint.serializer()), stored) }
+                .getOrElse {
+                    // 绝不静默失败：列表坏了重建内置端点，也要在 logcat 留下原因
+                    platformLog(TAG, "端点列表反序列化失败，重建内置端点：${it.message}")
+                    emptyList()
                 }
-            }
-            .getOrElse {
-                // 绝不静默失败：列表坏了宁可当空处理，也要在 logcat 留下原因
-                platformLog(TAG, "自定义端点列表反序列化失败，当作空列表：${it.message}")
-                emptyList()
-            }
-    }
-
-    private fun persistEndpoints(list: List<SavedEndpoint>) {
-        settings.putString(KEY_ENDPOINTS, json.encodeToString(ListSerializer(SavedEndpoint.serializer()), list))
+            return ensureBuiltinEndpoints(decoded)
+        }
+        // 没有新格式数据 → 从旧格式（预设槽位快照 + 已保存端点 + config 三元组）迁移
+        return migrateLegacyEndpoints()
     }
 
     /**
-     * 把当前填写的 Base URL / 模型名 / Key 存成自定义端点，**并立即启用它**。
-     *
-     * 同一 (baseUrl, model) 组合已存在时覆盖更新（Key 也会刷新），不产生重复项。
-     * @return 是否真的存了；URL 或模型名为空时拒绝，调用方（UI）应禁用按钮，
-     *         这里仍显式返回 false 而不是悄悄吞掉。
+     * 内置端点**可删除**（2026-10-15 用户拍板：列表完全由用户做主），
+     * 且删除必须跨启动生效——所以这里**不做"缺了就补"**，只在列表为空时
+     * （首次启动 / 数据损坏）种入出厂内置端点，保证永不出现
+     * "列表为空、没有端点可选"这种不可用状态。至少保留一条的约束在 removeEndpoint 里。
+     * 手动恢复入口在设置页「＋ 新增端点」下方（见 restoreBuiltinEndpoint）。
      */
-    fun saveCurrentEndpoint(): Boolean {
-        val baseUrl = config.baseUrl.trim()
-        val model = config.model.trim()
-        if (baseUrl.isBlank() || model.isBlank()) return false
-        val entry = SavedEndpoint(
-            id = SavedEndpoint.keyFor(baseUrl, model),
-            name = SavedEndpoint.hostOf(baseUrl),
-            baseUrl = baseUrl,
-            model = model,
-            apiKey = config.apiKey.trim(),
-        )
-        val next = savedEndpoints.toMutableList()
-        val idx = next.indexOfFirst { it.id == entry.id }
-        if (idx >= 0) next[idx] = entry else next.add(entry)
-        savedEndpoints = next
-        persistEndpoints(next)
-        // 保存即启用：providerId 指向该端点，与三元组一起随 config 落盘，重启后仍是它
-        updateConfig(config.copy(providerId = entry.id))
-        platformLog(TAG, "已保存并启用自定义端点：${entry.displayName} / ${entry.model}（共 ${next.size} 个）")
-        return true
-    }
-
-    /** 应用一个已保存的端点：providerId 指向它并回填三元组；Key 为空时保留当前 Key。 */
-    fun applyEndpoint(entry: SavedEndpoint) {
-        updateConfig(
-            config.copy(
-                providerId = entry.id,
-                baseUrl = entry.baseUrl,
-                model = entry.model,
-                apiKey = entry.apiKey.ifBlank { config.apiKey },
-            )
-        )
-    }
-
-    fun deleteEndpoint(entry: SavedEndpoint) {
-        val next = savedEndpoints - entry
-        savedEndpoints = next
-        persistEndpoints(next)
-        // 删除的正是当前使用的端点：config 里的三元组仍有效（请求不会断），
-        // 但它已不在列表 → providerId 回落为 CUSTOM，UI 会标注"未保存的自定义端点"，
-        // 不静默吞掉这个状态变化
-        if (config.providerId == entry.id) {
-            updateConfig(config.copy(providerId = ProviderCatalog.CUSTOM))
+    private fun ensureBuiltinEndpoints(list: List<Endpoint>): List<Endpoint> {
+        val builtinIds = ProviderCatalog.builtinPresets.map { it.id }.toSet()
+        // 归一化：id 是内置的，就一定算 builtin，且协议族 = 自身（防止手改过的存量数据带偏）
+        val normalized = list.map { ep ->
+            if (ep.id in builtinIds) ep.copy(builtin = true, protocol = ep.id) else ep
         }
+        if (normalized.isNotEmpty()) return normalized
+
+        val seeded = ProviderCatalog.builtinPresets.map { preset ->
+            Endpoint(
+                id = preset.id,
+                baseUrl = preset.baseUrl,
+                model = preset.defaultModel,
+                protocol = preset.id,
+                builtin = true,
+            )
+        }
+        platformLog(TAG, "端点列表为空，种入内置端点：${seeded.joinToString { it.id }}")
+        persistEndpoints(seeded)
+        return seeded
     }
 
-    /** 保存按钮的可用性：URL 与模型名都非空才有意义。 */
-    val canSaveEndpoint: Boolean
-        get() = config.baseUrl.isNotBlank() && config.model.isNotBlank()
+    private fun persistEndpoints(list: List<Endpoint>) {
+        settings.putString(KEY_ENDPOINTS, json.encodeToString(ListSerializer(Endpoint.serializer()), list))
+    }
+
+    /**
+     * 把旧格式（2026-10-15 之前）的数据合成一份端点列表。
+     *
+     * 三种来源一条都不能丢：
+     *   1. 内置两家：优先用该槽位快照，其次用"老 config 里正在用的那套"，最后才出厂默认；
+     *   2. `saved_endpoints_v1` 里的自定义端点；
+     *   3. 老 config 里正在用、但既不是内置也没进过列表的自定义端点
+     *      （旧版 UI 靠"未保存的自定义端点"提示兜着的那种）。
+     */
+    private fun migrateLegacyEndpoints(): List<Endpoint> {
+        val legacyConfig = settings.getString(KEY_CONFIG)?.let { raw ->
+            runCatching { json.decodeFromString(LegacyLlmConfig.serializer(), raw) }.getOrNull()
+        }
+        val legacySaved = settings.getString(KEY_ENDPOINTS_LEGACY)?.let { raw ->
+            runCatching { json.decodeFromString(ListSerializer(LegacySavedEndpoint.serializer()), raw) }.getOrNull()
+        }.orEmpty()
+        val legacyProfiles = settings.getString(KEY_PROFILES_LEGACY)?.let { raw ->
+            runCatching {
+                json.decodeFromString(
+                    MapSerializer(String.serializer(), LegacyProviderProfile.serializer()),
+                    raw,
+                )
+            }.getOrNull()
+        }.orEmpty()
+
+        val builtins = ProviderCatalog.builtinPresets.map { preset ->
+            val profile = legacyProfiles[preset.id]
+            val active = legacyConfig?.takeIf { it.providerId == preset.id }
+            Endpoint(
+                id = preset.id,
+                baseUrl = profile?.baseUrl?.ifBlank { null }
+                    ?: active?.baseUrl?.ifBlank { null }
+                    ?: preset.baseUrl,
+                model = profile?.model?.ifBlank { null }
+                    ?: active?.model?.ifBlank { null }
+                    ?: preset.defaultModel,
+                apiKey = profile?.apiKey?.ifBlank { null } ?: active?.apiKey.orEmpty(),
+                protocol = preset.id,
+                builtin = true,
+            )
+        }
+
+        val taken = builtins.map { it.id }.toMutableList()
+        val customs = legacySaved.map { ep ->
+            val id = Endpoint.newCustomId(taken)
+            taken += id
+            Endpoint(id = id, baseUrl = ep.baseUrl, model = ep.model, apiKey = ep.apiKey)
+        }
+
+        // 老 config 正在用、却没进过列表的自定义端点：补一条，否则升级那一刻就"换家"了
+        val lUrl = legacyConfig?.baseUrl
+        val lModel = legacyConfig?.model
+        val carried: List<Endpoint> = if (
+            legacyConfig != null &&
+            !lUrl.isNullOrBlank() && !lModel.isNullOrBlank() &&
+            legacyConfig.providerId !in ProviderCatalog.presets.map { it.id } &&
+            (builtins + customs).none { it.baseUrl == lUrl && it.model == lModel }
+        ) {
+            val id = Endpoint.newCustomId(taken)
+            taken += id
+            listOf(Endpoint(id = id, baseUrl = lUrl, model = lModel, apiKey = legacyConfig.apiKey.orEmpty()))
+        } else {
+            emptyList()
+        }
+
+        val merged = builtins + customs + carried
+        platformLog(
+            TAG,
+            "端点列表迁移：内置 ${builtins.size} + 自定义 ${customs.size} + 收编在用端点 ${carried.size}" +
+                "（迁移前 providerId=${legacyConfig?.providerId ?: "无"}）",
+        )
+        persistEndpoints(merged)
+        return merged
+    }
+
+    // ------------------------------------------------ 模型服务（唯一入口）
+    //
+    // 全部操作都只对着 endpoints 这一个列表做，不再有"切走前快照、切回来还原"这类补偿逻辑：
+    // 值本身就存在端点上，不存在"两份拷贝谁覆盖谁"的问题。
+
+    /**
+     * 切换当前端点。**"换用哪家"的唯一入口。**
+     *
+     * 幂等：已选中的再点一次直接返回（避免把刚填好的值原地重置那种老毛病）。
+     */
+    fun selectEndpoint(id: String) {
+        if (config.activeEndpointId == id) return
+        if (endpoints.none { it.id == id }) {
+            // 不静默：请求切到不存在的端点不是用户的错，但必须留痕
+            platformLog(TAG, "忽略切换请求：端点不存在（$id）")
+            return
+        }
+        updateConfig(config.copy(activeEndpointId = id))
+        platformLog(TAG, "当前端点 → ${activeEndpoint.displayName}（${activeEndpoint.chatCompletionsUrl}）")
+    }
+
+    /**
+     * 编辑**当前端点**的三元组，改一次落一次盘。
+     *
+     * 没有"草稿 + 保存按钮"两段式 —— 那正是"改了 URL、按完成却没生效"的来源。
+     * 传 null 表示该字段不动（三个输入框各自只提交自己那一项）。
+     */
+    fun editActiveEndpoint(baseUrl: String? = null, model: String? = null, apiKey: String? = null) {
+        val id = activeEndpoint.id
+        val next = endpoints.map { ep ->
+            if (ep.id != id) ep
+            else ep.copy(
+                baseUrl = baseUrl ?: ep.baseUrl,
+                model = model ?: ep.model,
+                apiKey = apiKey ?: ep.apiKey,
+            )
+        }
+        endpoints = next
+        persistEndpoints(next)
+    }
+
+    /** 新建一个自定义端点并立即选中 —— 用户接着在下方三个输入框里填就行。 */
+    fun addEndpoint() {
+        val ep = Endpoint(
+            id = Endpoint.newCustomId(endpoints.map { it.id }),
+            protocol = ProviderCatalog.CUSTOM,
+        )
+        val next = endpoints + ep
+        endpoints = next
+        persistEndpoints(next)
+        updateConfig(config.copy(activeEndpointId = ep.id))
+        platformLog(TAG, "新建端点 ${ep.id}，已切换为当前端点")
+    }
+
+    /**
+     * 改自定义端点的协议族（Claude 兼容 / 通用 OpenAI 兼容）。
+     * 内置端点的协议族固定为自身，不允许改 —— 改了它就不再是那家官方协议了。
+     */
+    fun setActiveProtocol(protocol: String) {
+        val active = activeEndpoint
+        if (active.builtin) return
+        val next = endpoints.map { if (it.id == active.id) it.copy(protocol = protocol) else it }
+        endpoints = next
+        persistEndpoints(next)
+        platformLog(TAG, "端点 ${active.displayName} 协议族 → ${next.first { it.id == active.id }.protocolLabel}")
+    }
+
+    /**
+     * 删除端点。内置端点**也可以删**（2026-10-15 用户拍板），唯一硬约束是
+     * **至少保留 1 条**——没有端点就无法发请求，这个状态不允许存在。
+     *
+     * 删掉的正是当前端点时回落到列表首项。**不静默**：日志一行，UI 选中态立刻可见。
+     * 删掉的内置端点可从设置页「＋ 新增端点」下方一键恢复（restoreBuiltinEndpoint）。
+     */
+    fun removeEndpoint(id: String) {
+        val target = endpoints.firstOrNull { it.id == id } ?: return
+        if (endpoints.size <= 1) {
+            platformLog(TAG, "拒绝删除 ${target.id}：至少要保留一个端点")
+            return
+        }
+        val next = endpoints - target
+        endpoints = next
+        persistEndpoints(next)
+        if (config.activeEndpointId == id) {
+            updateConfig(config.copy(activeEndpointId = next.first().id))
+        }
+        platformLog(
+            TAG,
+            "已删除端点 ${target.id}（${target.displayName}${if (target.builtin) "，内置" else ""}）",
+        )
+    }
+
+    /**
+     * 恢复一个内置官方端点并选中（设置页「＋ 新增端点」下方的快捷项）。
+     *
+     * 已在列表里时只做选中、不重复添加（幂等）。Key 为空，需要用户重新填。
+     */
+    fun restoreBuiltinEndpoint(presetId: String) {
+        val preset = ProviderCatalog.builtinPresets.firstOrNull { it.id == presetId } ?: return
+        if (endpoints.any { it.id == presetId }) {
+            selectEndpoint(presetId)
+            return
+        }
+        val ep = Endpoint(
+            id = preset.id,
+            baseUrl = preset.baseUrl,
+            model = preset.defaultModel,
+            protocol = preset.id,
+            builtin = true,
+        )
+        val next = endpoints + ep
+        endpoints = next
+        persistEndpoints(next)
+        updateConfig(config.copy(activeEndpointId = ep.id))
+        platformLog(TAG, "已恢复内置端点 ${preset.displayName} 并选中（API Key 需重新填写）")
+    }
+
+    /**
+     * 把内置端点还原为出厂值。
+     *
+     * **不动 apiKey**：用户只想去掉手改的 URL/模型名，顺手抹掉凭证是过度删除。
+     */
+    fun resetEndpointToDefaults(id: String) {
+        val target = endpoints.firstOrNull { it.id == id } ?: return
+        if (!target.builtin) return
+        val preset = ProviderCatalog.byId(id)
+        val next = endpoints.map {
+            if (it.id == id) it.copy(baseUrl = preset.baseUrl, model = preset.defaultModel) else it
+        }
+        endpoints = next
+        persistEndpoints(next)
+        platformLog(TAG, "端点 ${preset.displayName} 已还原出厂值（Base URL = ${preset.baseUrl}，Key 保留）")
+    }
 
     // 注意：不能叫 setIntent / setPerceptionId —— 会和 `var xxx` 自动生成的
     // JVM setter 撞签名（Platform declaration clash）。用 update* / select*。
@@ -240,7 +479,7 @@ class AppState(
             imageAttached = config.sendImage,
         ),
         imageAttached = config.sendImage,
-        model = config.model,
+        model = activeEndpoint.model,
         maxTokens = config.maxTokens,
         preview = true,
     )
@@ -248,10 +487,13 @@ class AppState(
     // ---------------------------------------------------------------- 分析
 
     fun analyze(photo: CapturedPhoto) {
-        if (!config.isConfigured) {
+        val endpoint = activeEndpoint
+        if (!endpoint.isUsable) {
             failure = FailureInfo(
                 FailureKind.NOT_CONFIGURED,
-                "还没填 API Key，先打开右上角设置填一下",
+                // 说清是**哪个**端点缺东西：多端点之后"还没填 Key"太含糊
+                "端点「${endpoint.displayName}」还没填全（Base URL / 模型名 / API Key），" +
+                    "点右上角设置补一下",
             )
             phase = AnalysisPhase.FAILED
             return
@@ -271,6 +513,7 @@ class AppState(
                 intent = intent,
                 perception = currentPerception(),
                 config = config,
+                endpoint = endpoint,
             )
             when (outcome) {
                 is HintOutcome.Success -> {
@@ -325,9 +568,47 @@ class AppState(
     private companion object {
         const val TAG = "AppState"
         const val KEY_CONFIG = "llm_config_v1"
-        const val KEY_ENDPOINTS = "saved_endpoints_v1"
+
+        /** 端点列表（唯一真相源）。 */
+        const val KEY_ENDPOINTS = "endpoints_v1"
+
+        // 下面两个是**只读**的旧格式 key：仅用于一次性迁移，不再写入。
+        // 刻意不删旧键 —— 万一迁移逻辑有问题，用户的数据还在，可以回滚排查。
+        const val KEY_ENDPOINTS_LEGACY = "saved_endpoints_v1"
+        const val KEY_PROFILES_LEGACY = "provider_profiles_v1"
     }
 }
+
+// ---------------------------------------------------------------------------
+// 旧格式 DTO —— 只用于一次性迁移，App 永远不写这些结构
+// ---------------------------------------------------------------------------
+
+/** 2026-10-15 之前的 LlmConfig：三元组直接存在 config 里，providerId 指向预设或 `saved:*`。 */
+@Serializable
+private data class LegacyLlmConfig(
+    val providerId: String? = null,
+    val baseUrl: String? = null,
+    val model: String? = null,
+    val apiKey: String? = null,
+)
+
+/** 2026-10-15 之前的"已保存端点"。 */
+@Serializable
+private data class LegacySavedEndpoint(
+    val id: String = "",
+    val name: String = "",
+    val baseUrl: String = "",
+    val model: String = "",
+    val apiKey: String = "",
+)
+
+/** 2026-10-15 之前的"预设槽位快照"（只在同一天内存在过，仍有用户带着它升级）。 */
+@Serializable
+private data class LegacyProviderProfile(
+    val baseUrl: String = "",
+    val model: String = "",
+    val apiKey: String = "",
+)
 
 @Composable
 fun rememberAppState(): AppState {

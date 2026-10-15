@@ -79,7 +79,7 @@ composeApp/src/commonMain/kotlin/com/photoguide/
     ├── CameraScreen.kt / HintCard.kt / SettingsScreen.kt / DebugPanel.kt / Theme.kt / App.kt
 ```
 
-### 2.3 三处值得单独说的实现选择
+### 2.3 几处值得单独说的实现选择
 
 **① "绝不静默失败"落到了每一层**
 
@@ -103,24 +103,133 @@ composeApp/src/commonMain/kotlin/com/photoguide/
 **链路每一段耗时**（感知/编码/组装/模型）+ 最近 30 次的 P50/P99 折线。
 位置和数据结构先立住，Phase 2 接入 YOLO 后在这里叠加归一化坐标的轮廓绘制即可。
 
+**④ 中途方案：给槽位加"记忆"（2026-10-15，当天即被 ⑤ 取代，留作决策痕迹）**
+
+设置页最初的模型是"预设 = 出厂常量"，带来一类必然出现的问题：用户手改的值
+（`deepseek` 加 `/v1`、换成中转站 URL）在切走再切回时被静默抹掉，而 UI 上
+只有一层淡背景色表示选中，用户无法判断"现在到底在用什么"。
+
+现在的模型：
+
+- `providerProfiles: Map<String, ProviderProfile(baseUrl, model, apiKey)>` 落盘。
+  切换前先给**离开的**槽位打快照，再载入**目标**槽位上次用的值（没有才用出厂默认）；
+  三个切换入口（换预设 / 换已保存端点 / 存成新端点）都走同一条路径，不各写一份；
+- `apiKey` 因此也按服务商分开记 —— 原先全局单 Key 时，切到 Claude 会拿着
+  DeepSeek 的 Key 去撞 401，用户只会得出"Claude 配不通"这个错误结论；
+- 卡片上有「生效中」文字徽标（不靠颜色猜）；手改时给「已手改」说明 +
+  「恢复默认」按钮（**只重置 URL/模型名，不动 Key** —— 顺手抹掉凭证是过度删除）；
+- "选中了哪个槽位"和"配置已偏离该槽位/列表里的值"是两件事，UI 分别说清楚。
+
+**⑤ 最终形态：端点列表即唯一真相源，快照表被删掉了（2026-10-15 同日）**
+
+④ 的快照表能修好 bug，但它本质是"同一份数据存两遍"的补救层 —— `providerProfiles`
+与 `savedEndpoints` 在存同一类东西，"配置偏离了选中项"这个状态因此永远存在。
+趁改动还热，直接收敛掉：
+
+- `Endpoint(id, baseUrl, model, apiKey, protocol, builtin)` 一个列表装下所有端点：
+  内置两家（DeepSeek / Claude）只是 `builtin = true` 的种子，可编辑、可重置、可删除
+  （同日第二轮改为可删：至少保留 1 条，删掉的内置端点从「＋ 新增端点」一键恢复）；
+- 输入框**直接编辑当前端点**（`editActiveEndpoint`），改一次落盘一次。
+  **没有保存按钮 = 没有"改了没保存"这个状态**。随之删掉的：
+  `providerProfiles` / `rememberCurrentProfile` / `switchProvider` / `applyEndpoint` /
+  `saveCurrentEndpoint` / `canSaveEndpoint` / `isProviderCustomized`，
+  以及 UI 上"已手改""未保存的自定义端点""＋ 保存并启用"三段文案；
+- `LlmConfig` 瘦身为**运行参数 + `activeEndpointId`**，`baseUrl/model/apiKey` 只存在
+  `Endpoint` 里一份。切端点本就不该改 `temperature/max_tokens`，这层切分正好也对；
+- `Endpoint.id` 改为**稳定 id**（内置 = preset id，自定义 = `ep:N`）。旧版是
+  `saved:` + baseUrl + model 推导出来的 —— **用户一改 URL，id 立即失效、选中态随之断裂**，
+  这正是坑 6 的底层原因，顺手一并修掉；
+- 协议族从 `providerId` 拆成端点的 `protocol` 字段：自定义端点跑 Claude 模型时选
+  「Claude 兼容」，才能拿到 temperature 上限 1.0、不发 `detail=low` 的正确行为
+  （用户明确选了"显式字段"而不是"按 URL 猜"——猜错时用户看不到任何提示）；
+- **迁移一次到位**：旧的三处数据（config 三元组 / `saved_endpoints_v1` /
+  `provider_profiles_v1`）合成列表；`activeEndpointId` 三级回落（新 id → 同名 providerId
+  → 三元组匹配），旧键**保留不删**，万一逻辑有问题数据还在，可回滚排查。
+
+> 教训（比代码本身值钱）：一个状态若能由两条路径写、或同一份值存了两份，
+> 就一定会出现"UI 说是 A、实际在用 B"的不可判定态。修法是**消掉重复**，
+> 而不是再补一层"提示用户两者不一致"的 UI —— 当天两个 bug 的正确解法都不是改文案。
+
+> 待补：`commonTest` 源集与 `kotlin-test` 尚未接入。本次改动几乎全是纯状态逻辑
+> （切换 / 编辑 / 删除 / 三级回落的迁移），却只能靠手工回归 —— 项目选 KMP 的
+> 理由之一就是"中间层可单测"，这层基建值得单独一轮补上（需同时处理 `platformLog`
+> 依赖 `android.util.Log` 在 JVM 单测下未被 mock 的问题，宜配合
+> `testOptions.unitTests.isReturnDefaultValues`）。
+
+**⑥ 输入框失焦即收软键盘，且这件事被脚本证明了（2026-10-15 修）**
+
+现象：改完 Base URL 去点端点卡片，键盘一直挂着遮住半屏、还盖住「完成」。
+
+根因一句话：**Compose 里 `clickable` 的兄弟节点不抢焦点**。输入框一直是聚焦态，
+系统没有任何理由收键盘 —— 所以"等系统自动收"这条路根本不通。
+
+修法（`SettingsScreen.kt`）：给三个输入框配 `ImeAction.Done`（回车 = 完成并收键盘），
+并在所有"非输入类"交互里显式 `focusManager.clearFocus() + keyboard?.hide()`
+（卡片 / 新增 / 恢复 / 协议 chip / 开关 / 滑杆 / 感知列表 / 「完成」），
+根 Column 挂 `detectTapGestures` 处理"点空白"。
+
+⚠️ **刻意没有用 `onFocusChanged { if (!it.isFocused) hide() }` 这个看起来很直觉的写法**：
+从 URL 直接点到模型名时，先收到 `false` 的那个字段会调 `clearFocus()`，
+而 `clearFocus()` 清的是整棵焦点树 —— 会把**刚拿到焦点的新字段**一起清掉
+（并且焦点回调的先后顺序无保证）。所以"失去焦点"这个触发条件本身不可靠，
+改用上面那组确定性的触发点。侧证：`clearFocus()` 在未聚焦时是幂等的，
+滑动滑杆连续触发也只是空操作，没有额外开销。
+
+> 验证方式（本机无真机也能做）：`tools/settings_keyboard_probe.py` 走 adb + uiautomator，
+> 断言 `dumpsys input_method` 的 `mInputShown`。覆盖"点输入框弹 / 点空白收 / 点卡片收 /
+> 换输入框不误伤 / 点完成收 + 返回"五条路径，连跑 3 轮 18/18 通过。
+> 相机链路必须真机，但**设置页这类纯 Compose 页面 AVD 上就能自动验证** —— 这条值得记住。
+
+写这类脚本会踩的两个坑（第一次跑就被坑了，写死坐标必错）：
+键盘弹出触发 adjustResize + 自动滚动，布局整体位移，必须每步重新 dump 拿实时 bounds；
+键盘还会遮住下方输入框、并把**顶部栏（含「完成」）滚出屏幕上方**，
+层级里直接看不到 —— 得先收键盘 / 滑回顶部再定位。
+
+**⑦ 顶栏固定，不再跟内容一起滚走（2026-10-15 同日修）**
+
+⑥ 的验证过程顺带暴露了下一个问题：键盘一弹、内容区自动上滚，顶栏（标题 + 「完成」）
+作为滚动内容的第一个孩子被一起推出屏幕上方 —— 用户想离开设置页得先把页面滑回顶部。
+
+修法：设置页拆成「固定顶栏 + 独立滚动区」两层 Column。外层只做 `safeDrawing` 内边距；
+顶栏 Row 与 `HorizontalDivider` 不参与滚动；内容区单独一个 `weight(1f) + verticalScroll`
+的 Column。「点空白收键盘」的 `pointerInput` 顶栏和内容区各挂一份（子元素消费掉的点击
+不会穿透，语义与 ⑥ 一致）。
+
+**连带的教训：探测脚本的锚点判据必须跟着换。** 脚本原用"设置页里一句说明文字可见"
+判断"在设置页"，但那句话会随内容滚出视口 —— 键盘一弹脚本就"找不到设置页"了。
+顶栏固定后它才是稳定锚点：页面判据改成「完成」按钮存在与否（拍照页没有它），
+"点空白"也优先点顶栏标题。**给会滚动的内容挑锚点，要挑不滚的那块。**
+
+回归脚本的"滑回顶部"绕行方案同步升级成真断言：键盘弹起时断言「完成」
+既在视口内、又在 `dumpsys window` 输入法窗口 `mGivenContentInsets` 算出的
+App 可视底边之上。3 轮 21/21 通过（完成 y=113~176 / 可视底=946）。
+
 ---
 
 ## 3. 远端大模型：可配置是怎么做的
 
 ```
-LlmConfig (可持久化，存 SharedPreferences / NSUserDefaults)
-  ├── providerId  : deepseek | openai-compatible
-  ├── baseUrl     : https://api.deepseek.com
-  ├── model       : deepseek-v4-flash-vision-exp   ← 可在设置页手改
-  ├── apiKey      : sk-…
-  ├── sendImage   : true   ← 关掉就退化成纯文本形态
-  ├── lowDetail   : true   ← 对应 detail=low（512×512 下采样）
+endpoints : List<Endpoint>          ← 唯一真相源，落盘
+  └── Endpoint(id, baseUrl, model, apiKey, protocol, builtin)
+        id       : 稳定 id。内置 = deepseek / claude，自定义 = ep:N（绝不由 URL 推导）
+        protocol : deepseek | claude | openai-compatible
+                   → 决定 temperature 上限与是否发 detail=low（协议族，不是"哪家"）
+        builtin  : 内置端点可编辑/可重置/可删除（至少保留 1 条），删掉后可一键恢复
+
+LlmConfig (落盘)                     ← 只剩运行参数 + 当前端点
+  ├── activeEndpointId : 指向 endpoints 里的一条
+  ├── sendImage        : true   ← 关掉就退化成纯文本形态
+  ├── lowDetail        : true   ← 对应 detail=low（512×512 下采样），协议不支持则自动跳过
   ├── temperature / maxTokens / timeoutMs
-  └── extraInstruction  ← 拼进 system prompt 的个性化要求
+  └── extraInstruction ← 拼进 system prompt 的个性化要求
 ```
 
 **换服务商不改代码**：通义 / 豆包 / 自建 vLLM / One-API 网关只要兼容
-`/chat/completions`，改 `baseUrl` + `model` 两个字段即可。
+`/chat/completions`，点「＋ 新增端点」填三元组即可；跑 Claude 模型的中转站把协议族
+选成「Claude 兼容」，避免 `detail=low` 被网关拒。
+
+**为什么 baseUrl/model/apiKey 不在 config 里**：同一份三元组存两遍，就会出现
+"config 改了、列表还是旧值"的不可判定态。只留一份，就没有需要同步的两份（§2.3 ⑤）。
 
 **为什么不用各家的原生 SDK**：一旦引入厂商 SDK，就等于把"可配置"这件事交出去了。
 OpenAI 兼容格式在 2026 年已经是事实标准，HTTP + JSON 这一层自己维护成本极低。
@@ -185,7 +294,7 @@ GitHub Actions / CI 上的命令行构建不受此限制（Gradle 不检查 IDE 
 
 ---
 
-## 6. 踩到的四个坑（都已修，记在这里省下次的时间）
+## 6. 踩到的坑（都已修，记在这里省下次的时间）
 
 | # | 现象 | 原因 | 修法 |
 |---|---|---|---|
@@ -193,6 +302,9 @@ GitHub Actions / CI 上的命令行构建不受此限制（Gradle 不检查 IDE 
 | 2 | `Const 'val' initializer must be a constant value` | `const val X = """…""".trimIndent()` —— `trimIndent()` 不是编译期常量 | 改成 `private val` |
 | 3 | `Platform declaration clash: setIntent(...)` | `var intent` 自动生成的 JVM setter 与我手写的 `fun setIntent()` 签名相同 | 方法改名 `updateIntent` / `selectPerception` |
 | 4 | AS 打开项目报 `incompatible version (AGP 8.13.0) ... Latest supported version is AGP 8.11.1`，Sync 被拒（命令行 `gradlew assembleDebug` 却完全正常） | AS 对 AGP 有**独立的兼容上界**，与 Gradle 无关。AS 2025.1.1 只到 AGP 8.11 | `libs.versions.toml` 里 `agp = "8.11.1"`；已在 AGP 8.11.1 下重新 `assembleDebug` 验证通过 |
+| 5 | `Return type mismatch: expected 'LlmResult', actual 'Any'`（`OpenAiCompatibleProvider.kt:89`） | 手改时 `} catch (e: Throwable) {` 被提前一行，`catch (e: CancellationException) { }` 变成**空体**（值类型 `Unit`），`try` 表达式类型塌成 `Any`；同时 `throw e` 之后的 `platformLog` / `LlmResult.Failure` 成了死代码 | 恢复顺序：`TimeoutCancellationException`（→ `Failure(TIMEOUT)`）→ `CancellationException`（→ `throw e`，保结构化并发）→ `Throwable`（→ log + `Failure`）。顺序不可调换，前者是后者的子类 |
+| 6 | 设置页"点 DeepSeek 卡会把手改的 Base URL 重置回出厂值" | 预设卡是**无状态**的：点击 = 无条件回填 `preset.baseUrl` / `defaultModel`，所以「改成 `…/v1` → 切 Claude → 切回 DeepSeek」必然丢手改值。顺带第二个坑：`apiKey` 是全局单个，切到 Claude 还在发 DeepSeek 的 Key | 先补 `ProviderProfile` 快照表（见 §2.3 ④），同日进一步**取消了快照表**：预设与自定义合并成单一 `endpoints` 列表，见坑 7 |
+| 7 | 同上问题的根因复发面：`providerProfiles` 与 `savedEndpoints` 在存同一类东西 | 同一份三元组被存两遍（config 一份、列表/快照一份）→ 必然产生"选中了 A 但在用 B"这种不可判定状态，两个 bug 只是它的两种表现 | 收敛成**一个 `endpoints` 列表 = 唯一真相源**：输入框直接编辑当前端点（改一次落盘一次），删掉快照表 / ＋保存按钮 / 手改提示；`id` 改为稳定 id（不再由 baseUrl+model 推导）。见 §2.3 ⑤ |
 
 ---
 

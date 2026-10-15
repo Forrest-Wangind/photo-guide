@@ -21,7 +21,10 @@ class LlmClient(
         ProviderCatalog.presets.associate { it.id to OpenAiCompatibleProvider(it, httpClient) }
 
     suspend fun complete(request: LlmRequest, config: LlmConfig): LlmResult {
-        val provider = providers[config.providerId] ?: providers.getValue(ProviderCatalog.DEEPSEEK)
+        // providerId 可能是内置预设 id（deepseek/claude），也可能是已保存自定义端点的
+        // "saved:xxx"——后者不在内置表里，统一走 OpenAI 兼容实现：
+        // 协议相同，三元组（url/model/key）都在 config 里，用哪个 preset 对象无差别
+        val provider = providers[config.providerId] ?: providers.getValue(ProviderCatalog.CUSTOM)
         return provider.complete(request, config)
     }
 

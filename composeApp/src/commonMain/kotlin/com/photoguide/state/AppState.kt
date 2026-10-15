@@ -14,6 +14,8 @@ import com.photoguide.decision.ShootingIntent
 import com.photoguide.llm.FailureKind
 import com.photoguide.llm.LlmClient
 import com.photoguide.llm.LlmConfig
+import com.photoguide.llm.ProviderCatalog
+import com.photoguide.llm.SavedEndpoint
 import com.photoguide.metrics.LatencyTrend
 import com.photoguide.metrics.StageTiming
 import com.photoguide.perception.NoPerception
@@ -28,6 +30,7 @@ import com.photoguide.prompt.PromptTrace
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 
 enum class AnalysisPhase { IDLE, ANALYZING, DONE, FAILED }
@@ -52,6 +55,10 @@ class AppState(
     private val json = Json { ignoreUnknownKeys = true; isLenient = true; explicitNulls = false }
 
     var config by mutableStateOf(loadConfig())
+        private set
+
+    /** 用户保存的自定义端点列表，落盘持久化，重启不丢。 */
+    var savedEndpoints by mutableStateOf(loadEndpoints())
         private set
 
     var intent by mutableStateOf(ShootingIntent())
@@ -117,6 +124,90 @@ class AppState(
         config = new
         settings.putString(KEY_CONFIG, json.encodeToString(LlmConfig.serializer(), new))
     }
+
+    // ------------------------------------------------ 自定义端点列表
+
+    // ⚠️ 序列化器必须在方法内现场创建，不能做成类成员属性：
+    // loadEndpoints() 在 `var savedEndpoints by mutableStateOf(...)` 的初始化阶段就被调用，
+    // 若 endpointListSerializer 声明在类体更靠后的位置，那一刻它还是 null，
+    // decodeFromString 收到 null 直接抛异常 → 列表每次启动都被打回空，
+    // 表现为"保存过的端点重启就丢"（2026-10-15 实锤，logcat 可见 parameter deserializer is null）
+    private fun loadEndpoints(): List<SavedEndpoint> {
+        val stored = settings.getString(KEY_ENDPOINTS) ?: return emptyList()
+        return runCatching { json.decodeFromString(ListSerializer(SavedEndpoint.serializer()), stored) }
+            // 旧版本存的数据没有 id：按确定性规则补齐，与 saveCurrentEndpoint 一致
+            .map { list ->
+                list.map { ep ->
+                    if (ep.id.isBlank()) ep.copy(id = SavedEndpoint.keyFor(ep.baseUrl, ep.model)) else ep
+                }
+            }
+            .getOrElse {
+                // 绝不静默失败：列表坏了宁可当空处理，也要在 logcat 留下原因
+                platformLog(TAG, "自定义端点列表反序列化失败，当作空列表：${it.message}")
+                emptyList()
+            }
+    }
+
+    private fun persistEndpoints(list: List<SavedEndpoint>) {
+        settings.putString(KEY_ENDPOINTS, json.encodeToString(ListSerializer(SavedEndpoint.serializer()), list))
+    }
+
+    /**
+     * 把当前填写的 Base URL / 模型名 / Key 存成自定义端点，**并立即启用它**。
+     *
+     * 同一 (baseUrl, model) 组合已存在时覆盖更新（Key 也会刷新），不产生重复项。
+     * @return 是否真的存了；URL 或模型名为空时拒绝，调用方（UI）应禁用按钮，
+     *         这里仍显式返回 false 而不是悄悄吞掉。
+     */
+    fun saveCurrentEndpoint(): Boolean {
+        val baseUrl = config.baseUrl.trim()
+        val model = config.model.trim()
+        if (baseUrl.isBlank() || model.isBlank()) return false
+        val entry = SavedEndpoint(
+            id = SavedEndpoint.keyFor(baseUrl, model),
+            name = SavedEndpoint.hostOf(baseUrl),
+            baseUrl = baseUrl,
+            model = model,
+            apiKey = config.apiKey.trim(),
+        )
+        val next = savedEndpoints.toMutableList()
+        val idx = next.indexOfFirst { it.id == entry.id }
+        if (idx >= 0) next[idx] = entry else next.add(entry)
+        savedEndpoints = next
+        persistEndpoints(next)
+        // 保存即启用：providerId 指向该端点，与三元组一起随 config 落盘，重启后仍是它
+        updateConfig(config.copy(providerId = entry.id))
+        platformLog(TAG, "已保存并启用自定义端点：${entry.displayName} / ${entry.model}（共 ${next.size} 个）")
+        return true
+    }
+
+    /** 应用一个已保存的端点：providerId 指向它并回填三元组；Key 为空时保留当前 Key。 */
+    fun applyEndpoint(entry: SavedEndpoint) {
+        updateConfig(
+            config.copy(
+                providerId = entry.id,
+                baseUrl = entry.baseUrl,
+                model = entry.model,
+                apiKey = entry.apiKey.ifBlank { config.apiKey },
+            )
+        )
+    }
+
+    fun deleteEndpoint(entry: SavedEndpoint) {
+        val next = savedEndpoints - entry
+        savedEndpoints = next
+        persistEndpoints(next)
+        // 删除的正是当前使用的端点：config 里的三元组仍有效（请求不会断），
+        // 但它已不在列表 → providerId 回落为 CUSTOM，UI 会标注"未保存的自定义端点"，
+        // 不静默吞掉这个状态变化
+        if (config.providerId == entry.id) {
+            updateConfig(config.copy(providerId = ProviderCatalog.CUSTOM))
+        }
+    }
+
+    /** 保存按钮的可用性：URL 与模型名都非空才有意义。 */
+    val canSaveEndpoint: Boolean
+        get() = config.baseUrl.isNotBlank() && config.model.isNotBlank()
 
     // 注意：不能叫 setIntent / setPerceptionId —— 会和 `var xxx` 自动生成的
     // JVM setter 撞签名（Platform declaration clash）。用 update* / select*。
@@ -234,6 +325,7 @@ class AppState(
     private companion object {
         const val TAG = "AppState"
         const val KEY_CONFIG = "llm_config_v1"
+        const val KEY_ENDPOINTS = "saved_endpoints_v1"
     }
 }
 

@@ -3,11 +3,14 @@ package com.photoguide.capture
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.util.Size
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
@@ -166,6 +169,20 @@ internal class AndroidCaptureController(
 
                 val capture = ImageCapture.Builder()
                     .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    // 分辨率上限 ~1600px：模型端 detail=low 本来就会下采样到 512，
+                    // 全尺寸原图（真机可达 4000px+）只会把 base64 请求体膨胀到几 MB ——
+                    // 上传更容易被掐断（ECONNABORTED）、编码更慢、token 更贵，没有任何收益。
+                    // FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER：取不到目标就取最接近的可用档。
+                    .setResolutionSelector(
+                        ResolutionSelector.Builder()
+                            .setResolutionStrategy(
+                                ResolutionStrategy(
+                                    Size(1600, 1200),
+                                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                                )
+                            )
+                            .build()
+                    )
                     .build()
 
                 provider.unbindAll()

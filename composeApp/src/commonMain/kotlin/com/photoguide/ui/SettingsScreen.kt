@@ -7,11 +7,14 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -31,6 +34,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.photoguide.llm.LlmConfig
 import com.photoguide.llm.ProviderCatalog
+import com.photoguide.llm.SavedEndpoint
 import com.photoguide.perception.PerceptionRegistry
 import com.photoguide.state.AppState
 
@@ -49,6 +53,10 @@ fun SettingsScreen(state: AppState) {
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
+            // edge-to-edge 下窗口画到键盘后面，adjustResize 不会自动让位：
+            // safeDrawing = 状态栏 + 导航条 + IME，键盘弹出时滚动容器随之收缩，
+            // 聚焦的输入框能被滚进可视区，不再被软键盘盖住
+            .windowInsetsPadding(WindowInsets.safeDrawing)
             .verticalScroll(rememberScrollState())
             .padding(16.dp),
     ) {
@@ -73,10 +81,12 @@ fun SettingsScreen(state: AppState) {
 
         Spacer(Modifier.height(16.dp))
 
-        // -------------------- 远端大模型 --------------------
-        SectionTitle("远端大模型")
+        // -------------------- 模型服务（统一入口）--------------------
+        // 内置预设 + 已保存的自定义端点同列展示，点选即切换；
+        // 选中项是 config.providerId 的一部分，随 config 落盘，重启不丢
+        SectionTitle("模型服务")
 
-        ProviderCatalog.presets.forEach { preset ->
+        ProviderCatalog.presets.filter { it.id != ProviderCatalog.CUSTOM }.forEach { preset ->
             val selected = config.providerId == preset.id
             Row(
                 modifier = Modifier
@@ -88,6 +98,8 @@ fun SettingsScreen(state: AppState) {
                         else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
                     )
                     .clickable {
+                        // 已选中的再点一次不做任何事——避免把手改过的 URL/模型名重置回预设值
+                        if (selected) return@clickable
                         state.updateConfig(
                             config.copy(
                                 providerId = preset.id,
@@ -109,6 +121,79 @@ fun SettingsScreen(state: AppState) {
                 }
             }
         }
+
+        state.savedEndpoints.forEach { entry ->
+            val selected = config.providerId == entry.id
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(
+                        if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+                        else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                    )
+                    .clickable { state.applyEndpoint(entry) }
+                    .padding(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = entry.displayName,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        text = entry.model,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 11.sp,
+                    )
+                }
+                Text(
+                    text = "删除",
+                    color = MaterialTheme.colorScheme.error,
+                    fontSize = 12.sp,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable { state.deleteEndpoint(entry) }
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                )
+            }
+        }
+
+        // 生效中但不在列表里的自定义端点：旧版本升级遗留（providerId 还是
+        // "openai-compatible"），或刚删掉了正在用的端点。绝不静默——明确告知并给"收编"路径
+        val selectedIsKnown =
+            ProviderCatalog.presets.any { it.id == config.providerId && it.id != ProviderCatalog.CUSTOM } ||
+                state.savedEndpoints.any { it.id == config.providerId }
+        if (!selectedIsKnown && config.baseUrl.isNotBlank()) {
+            Text(
+                text = "当前正在使用未保存的自定义端点（${SavedEndpoint.hostOf(config.baseUrl)}），" +
+                    "可点下方按钮保存进列表",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
+        }
+
+        val canSave = state.canSaveEndpoint
+        Text(
+            text = if (canSave) "＋ 把当前 Base URL / 模型名 / Key 保存为自定义端点并启用"
+            else "填好 Base URL 和模型名后可添加自定义端点",
+            color = if (canSave) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(
+                    if (canSave) MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
+                    else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+                )
+                .clickable(enabled = canSave) { state.saveCurrentEndpoint() }
+                .padding(10.dp),
+        )
 
         Spacer(Modifier.height(10.dp))
 
@@ -170,7 +255,7 @@ fun SettingsScreen(state: AppState) {
         )
         SwitchRow(
             title = "低分辨率模式",
-            subtitle = "服务端把图下采样到 512×512，更快更省 token（DeepSeek 的 detail=low）",
+            subtitle = "支持的服务商把图下采样到 512×512，更快更省 token（DeepSeek 的 detail=low；Claude 不支持，自动跳过）",
             checked = config.lowDetail,
             onCheckedChange = { state.updateConfig(config.copy(lowDetail = it)) },
         )

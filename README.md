@@ -25,8 +25,10 @@
 |---|---|
 | Android 构建 | ✅ `BUILD SUCCESSFUL`，产物 `composeApp-debug.apk`（15.7 MB） |
 | 源码量 | Kotlin 36 个文件 / 2979 行 |
-| 双端 | Android 已跑通构建；iOS 源码完整，**本机 Windows 无 Xcode，未编译验证** |
-| 阻塞项 | 缺一台 Android 真机、一个 DeepSeek API Key（均不阻塞代码） |
+| iOS — Kotlin 侧 | ✅ **已编译 + 链接通过**（`iosArm64` debug framework，250 MB） |
+| iOS — Xcode 工程 | ✅ 已生成（`.xcodeproj` + 共享 scheme）；**Swift 侧编译通过**，`import ComposeApp` 打通 |
+| iOS — 出包 | ❌ 卡在 **iOS SDK 版本**：本机 Xcode 14.2 只有 iOS 16.2 SDK，缺 CMP 1.11.1 直接引用的符号 |
+| 阻塞项 | 缺一台 Android / iPhone 真机、一个 DeepSeek API Key；iOS 出包需先升级 macOS + Xcode |
 
 Phase 1 范围：**单张照片** → 拍照 → 双栏建议卡。
 Phase 2 目标：**30fps 视频流**实时取景建议（感知层接口已预留在 `commonMain`）。
@@ -66,6 +68,8 @@ AVFoundation，**帧通路不必绕一层自有插件桥**；而调参代码能�
 - **JDK 21**（Android Studio 自带 JBR 即可）
 - **Android SDK**，含 `platforms/android-36`
 - 无真机时可用 AVD 跑通 UI（**但没有真实相机**，采集链路无法验收）
+
+**构建 iOS 另需**：macOS + Xcode，且 **Xcode 版本有硬门槛**（见 [§iOS](#ios)）。
 
 ### 构建 Android
 
@@ -119,9 +123,17 @@ adb install -r composeApp/build/outputs/apk/debug/composeApp-debug.apk
 
 ### iOS
 
-**必须 macOS + Xcode**，这是苹果生态的硬限制。
-本仓库只提交 iOS 侧源码，工程壳（`.xcodeproj`）在 Mac 上生成一次即可，
-补齐步骤见 [`iosApp/README.md`](iosApp/README.md)。
+```bash
+open iosApp/iosApp.xcodeproj     # 工程已生成，直接打开即可构建
+```
+
+**必须 macOS + Xcode，而且 Xcode 版本有硬门槛。**
+Compose Multiplatform 1.11.1 要求 Xcode 16+（社区实测需 **Xcode 26 / iOS 26 SDK**，
+卡点是它直接引用了 `UIViewLayoutRegion` 这类新符号）。
+
+本机现状：Xcode 14.2 → iOS SDK 16.2。Kotlin 侧的 `ComposeApp.framework`
+能编译能链接，Swift 侧也能编过，但**最后把 App 与 framework 链到一起时会因缺符号失败**。
+完整报错原文、核验方法与结论见 [`iosApp/README.md`](iosApp/README.md)。
 
 ---
 
@@ -142,7 +154,8 @@ composeApp/src/commonMain/kotlin/com/photoguide/
 
 composeApp/src/androidMain/   CameraX PreviewView + ImageCapture（内存拍照）· SharedPreferences · OkHttp
 composeApp/src/iosMain/       AVCaptureSession + AVCapturePhotoOutput · NSUserDefaults · Darwin
-iosApp/                       SwiftUI 入口 + Info.plist
+iosApp/                       Xcode 工程(.xcodeproj) + SwiftUI 入口 + Info.plist + 构建脚本
+                              ↳ 目录说明与构建链路见 iosApp/README.md
 docs/                         设计与决策文档
 tools/                        settings_keyboard_probe.py —— 设置页软键盘行为的 adb 回归脚本
 ```
@@ -244,9 +257,14 @@ interface PerceptionSource {
 
 ## 已知限制
 
-- **iOS 未编译验证**：本机 Windows 无 Xcode。首次在 Mac 上编译时，
-  若某处 AVFoundation 的 cinterop 签名对不上（Kotlin/Native 的 ObjC 映射偶尔与文档有出入），
-  按编译器提示调参数名或可空性即可，**逻辑结构不需要动**。
+- **iOS 出包卡在 SDK 版本**：Kotlin 侧 `ComposeApp.framework` 已编译+链接通过，
+  Xcode 工程已生成、Swift 侧也已编译通过；但 iOS 16.2 SDK 缺 CMP 1.11.1 引用的符号
+  （`UIViewLayoutRegion` / `UITextSelectionDisplayInteraction` 等），App 链接失败。
+  需 Xcode 16+（实测需 Xcode 26 + iOS 26 SDK），而升级 Xcode 需先升级 macOS。
+  详见 [`iosApp/README.md`](iosApp/README.md)。
+- **Intel Mac 上没有可用的 iOS 模拟器目标**：CMP 1.11.1 起移除了 `iosX64`
+  （该版本不再发布 x86_64 产物），所以工程只声明 `iosArm64` + `iosSimulatorArm64`；
+  后者要在 Apple Silicon 上才能跑。
 - **模拟器无真实相机**：AVD 只能跑通 UI，采集与端到端延迟必须真机。
 - **Android 部分机型不支持"预览 + 图像分析"并行**，Phase 2 需做启动时能力探测。
 - **感知层尚未接入**：Phase 1 的 `NoPerception` 不产生任何检测结果，

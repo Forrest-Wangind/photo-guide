@@ -31,6 +31,7 @@ import platform.AVFoundation.AVCaptureVideoPreviewLayer
 import platform.AVFoundation.AVLayerVideoGravityResizeAspectFill
 import platform.AVFoundation.AVMediaTypeVideo
 import platform.AVFoundation.authorizationStatusForMediaType
+import platform.AVFoundation.fileDataRepresentation
 import platform.AVFoundation.requestAccessForMediaType
 import platform.CoreGraphics.CGRectMake
 import platform.Foundation.NSData
@@ -45,9 +46,19 @@ import platform.posix.memcpy
 /**
  * iOS 相机实现（AVCaptureSession + AVCapturePhotoOutput）。
  *
- * ⚠️ 状态：代码完整，但**本机（Windows，无 Xcode）无法编译验证**。
- * 到 Mac 上第一次打开工程时，若 cinterop 签名有出入，按编译器提示微调即可，
- * 逻辑结构不需要动。
+ * 状态：已在 macOS + Xcode 14.2 上**编译并链接通过**（iosArm64 / debug framework）。
+ *
+ * 首次真正编译时暴露了两处 cinterop 签名问题，成因都不是"写错了"，
+ * 而是 Kotlin/Native 的 ObjC 映射与直觉写法不一致——记在这里省下次的时间：
+ *
+ *   1. `AVCaptureVideoPreviewLayer` 是 **CALayer 的子类，不是 UIView**，
+ *      所以只能 `layer.addSublayer()`，`addSubview()` 会因为参数类型不匹配编不过；
+ *   2. `fileDataRepresentation` 在 ObjC 里声明在 **category** 而不是主 @interface 上，
+ *      于是 Kotlin/Native 把它生成为 **包级扩展函数**
+ *      （`fun AVCapturePhoto.fileDataRepresentation(): NSData?`）而不是类成员。
+ *      后果：必须 `import platform.AVFoundation.fileDataRepresentation`，
+ *      否则报 `Unresolved reference`——可它明明在 klib metadata 里，
+ *      光看报错很容易往"方法名写错"的方向查）。
  */
 @Composable
 actual fun rememberCaptureController(): CaptureController {
@@ -80,7 +91,9 @@ actual fun CameraViewfinder(controller: CaptureController, modifier: Modifier) {
         modifier = modifier,
         factory = {
             val container = PreviewContainer(ios.previewLayer)
-            container.addSubview(ios.previewLayer)
+            // AVCaptureVideoPreviewLayer 是 CALayer 的子类，**不是 UIView**，
+            // 所以只能走 layer.addSublayer()；addSubview() 会因为类型不匹配编不过。
+            container.layer.addSublayer(ios.previewLayer)
             container
         },
         update = { view ->

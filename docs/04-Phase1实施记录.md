@@ -1,6 +1,7 @@
 # Phase 1 实施记录
 
-> 版本 v0.1 · 2026-10-14 · 状态：**Android 已构建通过（产出 debug APK）；iOS 代码就绪，本机无法编译**
+> 版本 v0.2 · 2026-10-16 · 状态：**Android 构建通过（debug APK）；iOS 的 framework 编译+链接通过、
+> Xcode 工程就位、Swift 侧编译通过；iOS 出包被 iOS SDK 版本卡住（见 §7）**
 > 上游：`docs/00-总体框架与实施计划.md` §2.5（演进架构）/ §7.1（Phase 1 精简路径）
 
 ---
@@ -43,7 +44,7 @@
 
 | 层 | 内容 | 状态 |
 |---|---|---|
-| 采集层 | 相机预览 + 内存拍照（不落盘） | ✅ Android(CameraX) / ✅ iOS(AVFoundation，未编译) |
+| 采集层 | 相机预览 + 内存拍照（不落盘） | ✅ Android(CameraX) / ✅ iOS(AVFoundation，已编译通过) |
 | 感知层 | `PerceptionSource` 接口 + `NoPerception` 空实现 + 注册表 | ✅ Phase 1 形态完成 |
 | 决策层 | `HintEngine` 编排 + 宽容解析 + 显式降级 | ✅ |
 | 模型层 | `LlmConfig` / `LlmProvider` / OpenAI 兼容实现 / `LlmClient` | ✅ |
@@ -281,6 +282,17 @@ OpenAI 兼容格式在 2026 年已经是事实标准，HTTP + JSON 这一层自�
 | Gradle | wrapper 8.13 已生成（`./gradlew` 可直接用） |
 | 环境 | JDK 21（Android Studio JBR）、Android SDK 36、NDK 26.1、24 核 |
 
+**2026-10-17 复测**（iOS 改动之后的回归）：
+
+| 目标 | 命令 | 结果 |
+|---|---|---|
+| Android | `assembleDebug` | ✅ BUILD SUCCESSFUL，APK 15 MB |
+| iOS 真机 | `linkDebugFrameworkIosArm64` | ✅ BUILD SUCCESSFUL，framework 245 MB |
+| iOS 模拟器 | `linkDebugFrameworkIosSimulatorArm64` | ✅ BUILD SUCCESSFUL，framework 148 MB |
+
+> `composeApp/build.gradle.kts` 里的层级模板与 target 改动是**共享配置**，
+> 所以 iOS 侧动完必须回头复测 Android —— 这一轮做过了，无回归。
+
 ---
 
 ## 5. 版本锁定：为什么是这一组
@@ -342,26 +354,150 @@ GitHub Actions / CI 上的命令行构建不受此限制（Gradle 不检查 IDE 
 
 ---
 
-## 7. iOS 侧状态
+## 7. iOS 侧状态（2026-10-16 更新）
 
-**结论：代码已写完整，但本机（Windows，无 Xcode）无法编译验证。**
+**结论：从"仅源码、未验证"推进到"framework 编译+链接通过、Xcode 工程就位、Swift 编译通过"。
+唯一剩下的阻塞是 iOS SDK 版本，不是代码、也不是工程配置。**
 
-Kotlin/Native 的 iOS target 已在 `composeApp/build.gradle.kts` 里用
-`os.name == Mac` 做条件声明——这样同一份仓库在 Windows 上只出 Android、
-在 macOS 上同时出 iOS framework，不会因为缺工具链而让 Windows 构建挂掉。
+### 7.1 已验证到哪一步
+
+| 环节 | 结果 | 证据 |
+|---|---|---|
+| iOS target 注册 | ✅ | `kotlin.targets` = `[android, iosArm64, iosSimulatorArm64, metadata]` |
+| Kotlin 源码编译 | ✅ | `compileKotlinIosArm64` 无错误 |
+| framework 链接 | ✅ | `linkDebugFrameworkIosArm64` BUILD SUCCESSFUL，`ComposeApp.framework` 250 MB |
+| Xcode 工程可解析 | ✅ | `xcodebuild -list` 得到 target `iosApp` / scheme `iosApp` |
+| 构建设置展开 | ✅ | `FRAMEWORK_SEARCH_PATHS` / `OTHER_LDFLAGS` / `INFOPLIST_FILE` 均正确 |
+| Run Script 调通 Gradle | ✅ | framework 成功产出到 `composeApp/build/xcode-frameworks/Debug/iphoneos16.2` |
+| Swift 编译 | ✅ | `import ComposeApp` + `MainViewControllerKt.MainViewController()` 通过 |
+| **App 链接（.app）** | ❌ | **iOS 16.2 SDK 缺 CMP 1.11.1 引用的符号**，见 §7.4 |
+
+### 7.2 这一轮改了什么
+
+| 文件 | 改动 |
+|---|---|
+| `composeApp/build.gradle.kts` | ① 显式 `applyDefaultHierarchyTemplate()`；② iOS target 去掉 `iosX64` |
+| `iosMain/.../MainViewController.kt` | 补 `import com.photoguide.ui.App` |
+| `iosMain/.../capture/CaptureController.ios.kt` | ① `addSubview` → `layer.addSublayer`；② 补 `import platform.AVFoundation.fileDataRepresentation` |
+| `iosApp/iosApp.xcodeproj/` | **新建**：`project.pbxproj` + 共享 scheme |
+| `iosApp/Configuration/Config.xcconfig` | 新建：TEAM_ID / BUNDLE_ID / APP_NAME |
+| `iosApp/scripts/compile-kotlin-framework.sh` | 新建：Run Script 的实际逻辑（含 JDK 探测） |
+| `iosApp/iosApp/Assets.xcassets/` | 新建：AppIcon / AccentColor 占位 |
+| `gradlew` | 改权限位 644 → 755 |
+
+### 7.3 四个坑（都不是"配置写错了"，是"不这么写就编不过"）
+
+**① `KotlinSourceSet with name 'iosMain' not found`**
+
+原代码在 `kotlin { }` 块内 `getByName("iosMain")`。KGP 的默认层级模板
+（负责把三个叶子源集 `iosX64Main` / `iosArm64Main` / `iosSimulatorArm64Main`
+归拢出共享父源集 `iosMain`）默认是在**块执行完之后**才应用的。
+于是在块内查 `iosMain` 必然扑空。
+
+修法：在 target 声明之后、`sourceSets { }` 之前显式调 `applyDefaultHierarchyTemplate()`。
+
+**② `iosX64` 是死目标——CMP 1.11.1 不再发布它的产物**
+
+```
+No matching variant of org.jetbrains.compose.ui:ui:1.11.1 was found.
+The consumer ... attribute 'org.jetbrains.kotlin.native.target' with value 'ios_x64'
+```
+该依赖公布的变体只有 `iosArm64` / `iosSimulatorArm64` / `android` / `desktop` / `js` /
+`wasmJs` / `macosArm64`，**没有 `ios_x64`**。Compose Multiplatform 自 1.11.1 起移除了
+Apple x86_64 目标。
+
+修法：iOS target 只声明 `iosArm64()` + `iosSimulatorArm64()`。
+**副作用**：Intel Mac 上再没有可跑的模拟器目标（模拟器要 iosX64）——
+对本项目无实质损失，因为相机链路本来就只能真机。
+
+**③ `AVCaptureVideoPreviewLayer` 不是 `UIView`**
+
+```
+Argument type mismatch: actual type is 'AVCaptureVideoPreviewLayer', but 'UIView' was expected.
+```
+它是 `CALayer` 的子类，所以给容器加预览层要 `container.layer.addSublayer(...)`，
+不能用 `addSubview(...)`。
+
+**④ `fileDataRepresentation` 是包级扩展函数，必须 import**
+
+```
+Unresolved reference 'fileDataRepresentation'
+```
+可它**明明在 klib metadata 里**。原因是它在 ObjC 里声明在 **category** 而非主
+`@interface` 上，Kotlin/Native 于是把它生成成
+`fun AVCapturePhoto.fileDataRepresentation(): NSData?` 这样的**包级扩展函数**，
+而不是类成员。
+
+修法：`import platform.AVFoundation.fileDataRepresentation`。
+
+> 判据（用 `klib dump-metadata` 时）：**有没有接收者前缀**。
+> `public open external fun capturePhotoWithSettings(...)` → 类成员；
+> `public final external fun platform/AVFoundation/AVCapturePhoto.xxx()` → 包级扩展，要 import。
+
+**⑤ Xcode 构建环境不继承 shell 配置 —— 报错极具误导性**
+
+Run Script 里直接 `./gradlew` 时，`JAVA_HOME` 为空，gradlew 退回到 PATH 上的 `java`
+（本机是 JDK 8），失败并报：
+
+```
+> Dependency requires at least JVM runtime version 11. This build uses a Java 8 JVM.
+Command PhaseScriptExecution failed with a nonzero exit code
+```
+
+看起来像依赖配置问题，实际只是没找到 JDK。修法：把逻辑抽到
+`iosApp/scripts/compile-kotlin-framework.sh`，按
+`JAVA_HOME` → Android Studio JBR → `java_home -v 21/17/11` 顺序显式挑一个。
+
+另有一个同源的小坑：`gradlew` 在仓库里是 **644**（无执行位），
+`./gradlew` 会以 `permission denied` 失败。已改为 755。
+
+### 7.4 真正的阻塞：iOS SDK 版本
+
+`xcodebuild ... -sdk iphoneos` 走到最后一步 Ld 时失败：
+
+```
+Undefined symbols for architecture arm64:
+  "_OBJC_CLASS_$_UITextLoupeSession"                in ComposeApp(CMPTextLoupeSession.o)
+  "_OBJC_CLASS_$_UITextSelectionDisplayInteraction" in ComposeApp(CMPEditMenuView.o)
+  "_OBJC_CLASS_$_UITraitUserInterfaceStyle"         in ComposeApp(CMPView.o)
+  "_OBJC_CLASS_$_UIViewLayoutRegion"                in ComposeApp(CMPLayoutRegion.o)
+  "_UIAccessibilityTraitToggleButton"               in ComposeApp(...UIKit-cache.a.o)
+```
+
+这些符号是 **Compose Multiplatform 1.11.1 的 iOS 实现直接引用**的，
+而本机 iOS 16.2 SDK 里不存在它们。核验（带阳性对照，否则测法本身可能无效）：
+
+```sh
+SDK=/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS16.2.sdk
+H="$SDK/System/Library/Frameworks/UIKit.framework/Headers"
+grep -rl UITextField                       "$H" | wc -l   # 11  ← 阳性对照
+grep -rl UIViewLayoutRegion                "$H" | wc -l   #  0
+grep -rl UITextSelectionDisplayInteraction "$H" | wc -l   #  0
+```
+
+| 依赖 | 要求 | 本机 |
+|---|---|---|
+| Xcode | **16+**；社区实测 CMP 1.11.1 需 **Xcode 26 / iOS 26 SDK**，卡点正是 `UIViewLayoutRegion` | **14.2** ❌ |
+| iOS SDK | 上述符号必须存在 | **16.2** ❌ |
+| macOS | 装得上满足要求的 Xcode | **12.7.6** (Monterey) ❌ |
+
+> **升级 Xcode 需先升级 macOS**，所以这是一次系统级动作，不是装个软件。
+> 在此之前，iOS 侧只能验收到 §7.1 那七行打 ✅ 的程度。
+
+### 7.5 文档与文件清单
 
 | 文件 | 状态 |
 |---|---|
-| `iosMain/.../MainViewController.kt` | 已写 |
-| `iosMain/.../capture/CaptureController.ios.kt` | 已写（AVCaptureSession + AVCapturePhotoOutput），**未编译** |
-| `iosMain/.../platform/SettingsStore.ios.kt` | 已写（NSUserDefaults） |
-| `iosMain/.../llm/HttpClientFactory.ios.kt` | 已写（Darwin 引擎） |
-| `iosApp/iosApp/iOSApp.swift` / `ContentView.swift` / `Info.plist` | 已写 |
-| `iosApp/iosApp.xcodeproj` | **未生成**（手写 pbxproj 无法在此验证），补齐步骤见 `iosApp/README.md` |
+| `iosMain/.../MainViewController.kt` | ✅ 已编译 |
+| `iosMain/.../capture/CaptureController.ios.kt` | ✅ 已编译（AVCaptureSession + AVCapturePhotoOutput） |
+| `iosMain/.../platform/SettingsStore.ios.kt` | ✅ 已编译（NSUserDefaults + `platformLog`） |
+| `iosMain/.../llm/HttpClientFactory.ios.kt` | ✅ 已编译（Darwin 引擎） |
+| `iosApp/iosApp/iOSApp.swift` / `ContentView.swift` / `Info.plist` | ✅ 已编译 |
+| `iosApp/iosApp.xcodeproj` | ✅ 已生成，含共享 scheme |
+| `iosApp/Configuration/Config.xcconfig` | ✅ 新建 |
+| `iosApp/scripts/compile-kotlin-framework.sh` | ✅ 新建 |
+| `iosApp/README.md` | ✅ 重写（原版基于"本机 Windows 无 Xcode"的前提，已不成立） |
 
-> 第一次在 Mac 上编译时，若某个 AVFoundation 的 cinterop 签名对不上
-> （Kotlin/Native 的 ObjC 映射偶尔与文档写法有出入），按编译器提示调参数名或可空性即可，
-> **逻辑结构不需要动**。
 
 ---
 
@@ -373,12 +509,18 @@ Kotlin/Native 的 iOS target 已在 `composeApp/build.gradle.kts` 里用
    端到端延迟，都必须真机才能验。模拟器可跑通 UI，但没有真实相机。
 2. **一个 DeepSeek API Key** —— 填进设置页即可跑通端到端。
    （也可以先不填，App 会明确提示"还没配置 API Key"而不是崩掉。）
+3. **iOS 出包需要先升级 macOS + Xcode**（§7.4）—— Kotlin 侧已经全绿，
+   缺的是 iOS SDK 里的符号。这是一次系统级动作，不是代码问题。
 
 **代码侧待办（不阻塞）**
 
 - 拍照后按 EXIF 旋转把 JPEG 真正转正（现在只传了 `rotationDegrees`，未重编码）
 - 图片上传前按 `imageMaxEdge` 做客户端下采样（现在依赖服务端 `detail=low`）
 - Phase 1 验收：把"拍照 → 双栏建议卡"的**端到端延迟**和**建议采纳率**跑出来
+- iOS：升到能编的 Xcode 后，`CaptureController.ios.kt` 里 `CapturedPhoto`
+  的 `width` / `height` / `rotationDegrees` 还是写死的 0（真实尺寸留给 Phase 2 从 CGImage 补）
+- iOS：`CameraViewfinder` 用的 `UIKitView` 在 CMP 1.11.1 已标记 deprecated
+  （建议改用带 `UIKitInteropProperties` 的新签名），当前仅告警不影响构建
 
 **Phase 2 预留（接口已就位，只等实现）**
 

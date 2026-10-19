@@ -11,6 +11,9 @@ import com.photoguide.decision.CompositionHint
 import com.photoguide.decision.HintEngine
 import com.photoguide.decision.HintOutcome
 import com.photoguide.decision.ShootingIntent
+import com.photoguide.guide.CompositionGuide
+import com.photoguide.guide.GuideRecommendation
+import com.photoguide.guide.GuideRecommender
 import com.photoguide.llm.Endpoint
 import com.photoguide.llm.FailureKind
 import com.photoguide.llm.LlmClient
@@ -111,9 +114,72 @@ class AppState(
     var showDebug by mutableStateOf(false)
         private set
 
+    /**
+     * 底部意图面板是否**收起在左侧**。
+     *
+     * 收起的动机是取景：面板（场景芯片 + 描述输入）常态占掉底部约四分之一屏幕，
+     * 而"看画面"才是这个 App 的主任务。收起后只留左侧一条把手，拍照按钮原地不动 ——
+     * 收起是为了看画面，不是为了不能按快门。
+     *
+     * 落盘：这是"我这阵子都想大屏取景"的偏好，不是一次性的临时动作。
+     */
+    var inputPanelCollapsed by mutableStateOf(loadPanelCollapsed())
+        private set
+
+    /** 面板收起/展开（拖动吸附结束或点击把手时调用）。只需布尔：中间过程是动画值，不该落盘。 */
+    fun updateInputPanelCollapsed(collapsed: Boolean) {
+        if (inputPanelCollapsed == collapsed) return
+        inputPanelCollapsed = collapsed
+        settings.putString(KEY_PANEL_COLLAPSED, if (collapsed) "1" else "0")
+        platformLog(TAG, if (collapsed) "意图面板 → 收起（左侧把手）" else "意图面板 → 展开")
+    }
+
+    /** 默认展开：新用户第一次打开要能看见"选场景/写描述"这件事。 */
+    private fun loadPanelCollapsed(): Boolean {
+        val raw = settings.getString(KEY_PANEL_COLLAPSED) ?: return false
+        return when (raw) {
+            "1" -> true
+            "0" -> false
+            else -> {
+                platformLog(TAG, "未知面板折叠配置「$raw」，回退为展开")
+                false
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- 参考线
+    //
+    // ⚠️ 只存"手动锁定"这一个字段，生效值全部**推导**出来（manualGuide ?: 推荐 ?: NONE）。
+    // 不把"当前生效的参考线"再存一份 —— 那是 2026-10-15 端点三元组踩过的同一个坑：
+    // 同一份值存两份，必然出现"UI 说 A、实际画的是 B"。这里如果另存一份 guide，
+    // 用户一换场景就会出现"面板显示三分线、画面画着中心十字"的不可判定态。
+
+    /**
+     * 用户手动锁定的参考线；**null = 自动**（跟随拍摄意图）。
+     *
+     * 自动是默认：目标用户（不会构图的人）不该先学会"我这场景该用哪条线"才能用上功能。
+     * 手动一旦选定就不再自动改 —— 用户明确表达过的偏好，不该被场景切换悄悄覆盖。
+     */
+    var manualGuide by mutableStateOf(loadManualGuide())
+        private set
+
+    /** 当前意图的推荐；null 表示没有明确适用的线（不硬推）。 */
+    val guideRecommendation: GuideRecommendation?
+        get() = GuideRecommender.recommend(intent)
+
+    /** 正在自动模式下，且确实推荐出了东西。 */
+    val guideIsAuto: Boolean get() = manualGuide == null
+
+    /** 当前实际生效的参考线 —— UI 与绘制层都只读这一个。 */
+    val guide: CompositionGuide
+        get() = manualGuide ?: guideRecommendation?.guide ?: CompositionGuide.NONE
+
     val trend = LatencyTrend()
 
     private var job: Job? = null
+
+    /** 上一次打过日志的自动推荐值，仅用于去重（不参与任何判断）。 */
+    private var lastAutoLogged: CompositionGuide? = null
 
     // ---------------------------------------------------------------- 配置
 
@@ -452,6 +518,7 @@ class AppState(
     // JVM setter 撞签名（Platform declaration clash）。用 update* / select*。
     fun updateIntent(new: ShootingIntent) {
         intent = new
+        logAutoGuideChange()
     }
 
     fun selectPerception(id: String) {
@@ -477,6 +544,7 @@ class AppState(
             ),
             config = config,
             imageAttached = config.sendImage,
+            guide = guide,
         ),
         imageAttached = config.sendImage,
         model = activeEndpoint.model,
@@ -507,10 +575,16 @@ class AppState(
         lastPhotoInfo = "$photo"
         timings = emptyList()
 
+        // 意图与参考线在**发起这一刻**取快照：分析跑起来之后用户还可能改芯片/改描述，
+        // 提示词里必须描述"这张照片拍的时候是怎么设定的"，不能中途被改掉。
+        val intentSnapshot = intent
+        val guideSnapshot = guide
+
         job = scope.launch {
             val outcome = engine.analyze(
                 photo = photo,
-                intent = intent,
+                intent = intentSnapshot,
+                guide = guideSnapshot,
                 perception = currentPerception(),
                 config = config,
                 endpoint = endpoint,
@@ -560,6 +634,56 @@ class AppState(
     fun closeSettings() { showSettings = false }
     fun toggleDebug() { showDebug = !showDebug }
 
+    // ---------------------------------------------------------------- 参考线
+
+    /** 手动选定一条参考线（含"关闭"）。选完即进入锁定态，换场景不再自动改。 */
+    fun selectGuide(new: CompositionGuide) {
+        if (manualGuide == new) return
+        manualGuide = new
+        settings.putString(KEY_GUIDE, new.name)
+        platformLog(TAG, "参考线 → ${new.displayName}（手动锁定）")
+    }
+
+    /** 回到自动模式：跟随意图推荐。已经自动时幂等返回。 */
+    fun useAutoGuide() {
+        if (manualGuide == null) return
+        manualGuide = null
+        settings.putString(KEY_GUIDE, GUIDE_AUTO)
+        platformLog(TAG, "参考线 → 自动（当前推荐：${guideRecommendation?.guide?.displayName ?: "无"}）")
+    }
+
+    /**
+     * 读不到 / 认不出（枚举改名、脏数据）就回退**自动**，但必须留痕：
+     * 静默回退会让"我明明锁了三分线"变成无法解释的灵异事件。
+     */
+    private fun loadManualGuide(): CompositionGuide? {
+        val raw = settings.getString(KEY_GUIDE) ?: return null
+        if (raw == GUIDE_AUTO) return null
+        return CompositionGuide.entries.firstOrNull { it.name == raw } ?: run {
+            platformLog(TAG, "未知参考线配置「$raw」，回退为自动")
+            null
+        }
+    }
+
+    /**
+     * 自动模式下意图变了 → 推荐可能跟着变，打一行日志。
+     *
+     * 只在 [updateIntent] 里调用（不要放进 `guide` 的 getter：那是每次重组都会跑的路径）。
+     * 记录 `lastAuto` 是为了避免"同一个推荐每敲一个字就打一行"。
+     */
+    private fun logAutoGuideChange() {
+        if (manualGuide != null) return
+        val rec = GuideRecommender.recommend(intent)
+        val picked = rec?.guide
+        if (picked == lastAutoLogged) return
+        lastAutoLogged = picked
+        if (rec == null) {
+            platformLog(TAG, "参考线自动 → 无（当前意图没有明确对应的线）")
+        } else {
+            platformLog(TAG, "参考线自动 → ${rec.guide.displayName}（${rec.reason}）")
+        }
+    }
+
     fun shutdown() {
         job?.cancel()
         llmClient.close()
@@ -571,6 +695,15 @@ class AppState(
 
         /** 端点列表（唯一真相源）。 */
         const val KEY_ENDPOINTS = "endpoints_v1"
+
+        /** 参考线：手动锁定的枚举 name，或 [GUIDE_AUTO]。 */
+        const val KEY_GUIDE = "composition_guide_v1"
+
+        /** "自动"的落盘值。用字面量而不是枚举 name，避免与将来可能的枚举项撞名。 */
+        const val GUIDE_AUTO = "AUTO"
+
+        /** 底部意图面板是否收起（"1"/"0"）。 */
+        const val KEY_PANEL_COLLAPSED = "input_panel_collapsed_v1"
 
         // 下面两个是**只读**的旧格式 key：仅用于一次性迁移，不再写入。
         // 刻意不删旧键 —— 万一迁移逻辑有问题，用户的数据还在，可以回滚排查。

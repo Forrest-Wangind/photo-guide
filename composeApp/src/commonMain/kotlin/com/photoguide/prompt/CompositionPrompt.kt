@@ -1,6 +1,7 @@
 package com.photoguide.prompt
 
 import com.photoguide.decision.ShootingIntent
+import com.photoguide.guide.CompositionGuide
 import com.photoguide.llm.LlmConfig
 import com.photoguide.perception.PerceptionSnapshot
 import kotlinx.serialization.json.Json
@@ -95,6 +96,15 @@ object CompositionPrompt {
         perception: PerceptionSnapshot,
         config: LlmConfig,
         imageAttached: Boolean,
+        /**
+         * 取景器上正显示着的参考线。
+         *
+         * 为什么会出现在提示词里：参考线是**画在用户眼前的**，模型不知道它的存在，
+         * 就会说"稍微往左一点"——而用户眼前横着四条三分线，这句话没法核对。
+         * 告诉模型"用户正开着三分线"，它才能说"把她的眼睛放到右上交点"，
+         * 参考线和台词才是一件事，而不是两个各说各话的功能。
+         */
+        guide: CompositionGuide = CompositionGuide.NONE,
     ): String = buildString {
         appendLine("【用户的拍摄意图】")
         val preset = intent.preset
@@ -119,6 +129,27 @@ object CompositionPrompt {
             // 既不选场景也不写字：不能默认成"人像半身"硬凑一套建议
             appendLine("- 用户既没选场景也没写说明。请先根据画面内容判断主体是什么，再给针对性建议；")
             appendLine("  若画面里没有可辨认的明确主体，必须在 warnings 里说明\"本次为通用指引\"。")
+        }
+        appendLine()
+
+        appendLine("【屏幕上的参考线】")
+        if (guide == CompositionGuide.NONE) {
+            appendLine("用户没有开启参考线，画面上没有任何辅助线。")
+            appendLine("位置类建议请用自然语言表达（左/右/上/下、靠近画面边缘、占画面几分之几），")
+            appendLine("**不要**引用\"三分线交点\"\"黄金线\"这类画面上并不存在的参照。")
+        } else {
+            appendLine("用户正开着「${guide.displayName}」：${guide.promptHint}。")
+            appendLine("这是用户抬眼就能看到的线，所以位置类建议**必须直接引用它**。")
+            appendLine("正例：\"把她的眼睛放到右上交点\"、\"让杯口压在右下那条黄金线上\"、\"往左挪，让她落在左边那条竖线上\"。")
+            appendLine("反例（禁止）：\"稍微往左一点\"\"再靠近一点\"——对不上用户眼前看到的东西。")
+            if (guide == CompositionGuide.SAFE_FRAME) {
+                appendLine("注意：安全框是**裁切**提示，不是构图线。主体仍按常规构图摆放，")
+                appendLine("只需保证关键内容（人脸、手、产品主体）不跑出框外。")
+            }
+            if (guide == CompositionGuide.SPIRAL) {
+                appendLine("黄金螺旋的\"眼睛\"是一个具体落点：请说清主体该落在螺旋中心附近，")
+                appendLine("而不是笼统地让人\"往螺旋方向靠\"。")
+            }
         }
         appendLine()
 

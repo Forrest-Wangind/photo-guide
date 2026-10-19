@@ -3,22 +3,22 @@ package com.photoguide.llm
 import kotlinx.serialization.Serializable
 
 /**
- * 远端大模型配置 —— 完全可配置，不写死任何一家。
+ * 运行期配置。
  *
- * 默认值指向 DeepSeek 的视觉实验模型：
- *   baseUrl = https://api.deepseek.com
- *   model   = deepseek-v4-flash-vision-exp
- * 该模型兼容 OpenAI Chat Completions 格式，图片最多按 384 token/张计费，
- * 输入 ¥1 / 输出 ¥2 每百万 token（2026-08 上线时口径，以官方文档为准）。
+ * ⚠️ 2026-10-15 起**只留两样东西**：
+ *   1. 当前生效的端点 id（指向 [Endpoint] 列表里的一条）；
+ *   2. 与"用哪家"无关的运行参数（随机性 / 输出上限 / 超时 / 是否传图 / 额外要求）。
  *
- * 换成任何 OpenAI 兼容端点（通义 / 豆包 / 自建 vLLM / One-API 网关）只需改这三个字段。
+ * baseUrl、model、apiKey **不再存在这里** —— 它们属于 [Endpoint]，只存一份。
+ * 过去这里也放一份，于是"改了 config 但列表里还是旧值"这种不可判定状态永远可能存在
+ * （2026-10-15 连出两个 bug 的根因）。而且切换端点本就不该连带改 temperature /
+ * max_tokens，这层切分也正好是对的。
  */
 @Serializable
 data class LlmConfig(
-    val providerId: String = ProviderCatalog.DEEPSEEK,
-    val baseUrl: String = "https://api.deepseek.com",
-    val model: String = "deepseek-v4-flash-vision-exp",
-    val apiKey: String = "",
+    /** 当前生效端点 id。内置端点的 id 即 preset id（deepseek / claude），自定义为 `ep:N`。 */
+    val activeEndpointId: String = ProviderCatalog.DEEPSEEK,
+
     /**
      * 采样随机性。UI 上叫「随机性」，**不要翻成"温度"**——
      * 拍照类产品里"温度"第一反应是色温，会把人带偏。
@@ -40,19 +40,15 @@ data class LlmConfig(
     val sendImage: Boolean = true,
 
     /**
-     * DeepSeek 的 detail=low 会把图下采样到 512x512 再推理，更快更便宜。
-     * 这正好对应 §2.4 三件套里的「缩略图」那一件。
+     * detail=low 会把图下采样到 512x512 再推理，更快更便宜（§2.4 三件套里的「缩略图」）。
+     * 协议不支持该参数的端点（Claude）由 provider 自动跳过，不会发出去被网关拒。
      */
     val lowDetail: Boolean = true,
 
     /** 用户在设置里追加的额外要求，会拼进 system prompt。 */
     val extraInstruction: String = "",
+
 ) {
-    val isConfigured: Boolean
-        get() = apiKey.isNotBlank() && baseUrl.isNotBlank() && model.isNotBlank()
-
-    val endpoint: String get() = baseUrl.trimEnd('/') + "/chat/completions"
-
     companion object {
         /** 当前默认输出上限。 */
         const val DEFAULT_MAX_TOKENS = 4096

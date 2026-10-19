@@ -87,26 +87,35 @@ adb install -r composeApp/build/outputs/apk/debug/composeApp-debug.apk
 
 ### 配置远端大模型
 
-首次运行后进入 **设置页**，填入 API Key 即可跑通端到端。
-**不填也能启动**——App 会明确提示「还没配置 API Key」并引导到设置页，不会崩。
+首次运行后进入 **设置页**，给端点填上 API Key 即可跑通端到端。
+**不填也能启动**——App 会明确提示「端点 X 还没填全」并引导到设置页，不会崩。
 
-默认指向 DeepSeek 的视觉实验模型（`deepseek-v4-flash-vision-exp`，兼容 OpenAI Chat Completions）。
-换成任何 OpenAI 兼容端点（通义 / 豆包 / 自建 vLLM / One-API 网关）只需改
-`baseUrl` + `model` 两个字段，**不需要改代码**。
+模型服务只有**一个概念：端点列表**。内置两条（DeepSeek / Claude），点任意一条即切换生效；
+下方输入框直接编辑**当前选中**的那条，**改一个字就存一次** —— 没有"保存"按钮，
+也就不存在"改了 URL 按完成却没生效"这类状态。要接自己的中转站 / 自建服务，点「＋ 新增端点」。
 
-| 配置项 | 默认值 | 说明 |
+自定义端点可以选**协议族**（决定请求细节，不同就直接 400）：
+
+| 协议族 | temperature 上限 | `detail=low` |
 |---|---|---|
-| `providerId` | `deepseek` | 服务商预设 |
-| `baseUrl` | `https://api.deepseek.com` | 兼容 `/chat/completions` 即可 |
-| `model` | `deepseek-v4-flash-vision-exp` | **特意做成可编辑**，服务商模型名变动比 App 迭代快 |
-| `apiKey` | — | 存 SharedPreferences / NSUserDefaults |
-| `sendImage` | `true` | 关掉退化成纯文本形态（但拿不到审美判断） |
-| `lowDetail` | `true` | 对应 `detail=low`，服务端下采样到 512×512，更快更便宜 |
-| `temperature` / `maxTokens` / `timeoutMs` | 0.6 / 900 / 60000 | |
-| `extraInstruction` | — | 个性化要求，拼进 system prompt |
+| OpenAI 兼容（通用） | 1.5 | 会发 |
+| Claude 兼容 | 1.0（自动截断） | **不发**（Claude 拒该参数） |
 
-> ⚠️ 该模型官方标注为**实验性质**，模型名与计费口径都可能在正式版变化。
-> 这正是模型名不写死的原因。仓库不提交任何密钥（`secrets.properties` 已在 `.gitignore`）。
+| 字段 | 说明 |
+|---|---|
+| `endpoints` 列表 | 端点三元组（`baseUrl` / `model` / `apiKey`）+ 协议族。**唯一的真相源**，输入框直接编辑这里 |
+| `activeEndpointId` | 当前生效端点 |
+| `temperature` / `maxTokens` / `timeoutMs` | 运行参数：0.6 / 4096 / 60000。与"用哪家"无关，**切端点不会连带改** |
+| `sendImage` / `lowDetail` / `extraInstruction` | 是否传图 / 低分辨率下采样 / 个性化要求（拼进 system prompt） |
+
+全部存 SharedPreferences / NSUserDefaults，不提交任何密钥（`secrets.properties` 已在 `.gitignore`）。
+
+> **升级自动迁移**：旧版散在三处的数据（config 里的三元组、`saved_endpoints_v1`、
+> `provider_profiles_v1`）会合成端点列表，内置两家优先取你改过的值；旧键**刻意保留不删**，
+> 万一要回滚排查，数据还在。
+
+> ⚠️ DeepSeek 视觉模型官方标注为**实验性质**，模型名与计费口径都可能在正式版变化。
+> 这正是模型名不写死的原因。
 
 ### iOS
 
@@ -135,7 +144,12 @@ composeApp/src/androidMain/   CameraX PreviewView + ImageCapture（内存拍照�
 composeApp/src/iosMain/       AVCaptureSession + AVCapturePhotoOutput · NSUserDefaults · Darwin
 iosApp/                       SwiftUI 入口 + Info.plist
 docs/                         设计与决策文档
+tools/                        settings_keyboard_probe.py —— 设置页软键盘行为的 adb 回归脚本
 ```
+
+> `tools/settings_keyboard_probe.py` 用 adb + uiautomator 断言软键盘收放（`mInputShown`），
+> 跑法：`python tools/settings_keyboard_probe.py [轮数]`。
+> 设置页不依赖相机，所以 AVD 上就能跑完整验证（相机链路才必须真机）。
 
 ---
 

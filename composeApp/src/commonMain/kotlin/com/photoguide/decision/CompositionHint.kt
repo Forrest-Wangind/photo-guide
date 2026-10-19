@@ -62,4 +62,56 @@ data class CompositionHint(
             photographerActions.isNotEmpty() ||
             modelLines.isNotEmpty() ||
             sceneNotes.isNotEmpty()
+
+    /**
+     * 拍一张照片时**实际要做的事**，按执行顺序排好的一条条建议。
+     *
+     * 为什么需要它：上面那四个数组是"模型给的分类"，不是"用户的操作序列"。
+     * 分类并列意味着没有先后——可现实中这些事有严格顺序，顺序错了建议就是废的。
+     *
+     * 排序依据是**执行时序**，不是主观重要度：
+     *   1. 先改机位 —— 手能立刻动的、且是后面一切的前提；
+     *   2. 再开口（台词 / 画面要点）—— 台词虽然是本产品最差异化的东西，
+     *      但机位错了还念台词等于白念，所以它不能排第一条；
+     *   3. 最后是问题诊断 —— 它解释"为什么"，需要理解，放在动作之后。
+     *
+     * ⚠️ [warnings] **刻意不在这里**。它是可信度信息（"输出被截断""没收到画面"），
+     * 不是动作。混进 3 条序列里用户一翻就翻过去了，而它恰恰最不该被翻过去。
+     * 它由卡片自己做成常驻细条展示（见 HintCard）。
+     *
+     * 这是**派生**属性，不新增字段、不改提示词：CompositionHint 仍是唯一真相源，
+     * 模型输出结构和存量数据都不受影响。
+     */
+    val steps: List<HintStep>
+        get() = buildList {
+            photographerActions.filter { it.isNotBlank() }
+                .forEach { add(HintStep(HintKind.CAMERA, it)) }
+            secondColumnLines.filter { it.isNotBlank() }.forEach {
+                add(HintStep(if (hasPerson) HintKind.LINE else HintKind.SCENE, it))
+            }
+            issues.filter { it.isNotBlank() }
+                .forEach { add(HintStep(HintKind.ISSUE, it)) }
+        }
 }
+
+/**
+ * 一条建议的类型。决定它在 [CompositionHint.steps] 里的位置，以及卡片上的标签与配色。
+ */
+enum class HintKind(val label: String) {
+    /** 摄影师自己动手改的：机位、角度、距离、构图修正。 */
+    CAMERA("机位"),
+
+    /** 对模特说的话，可以直接照着念。 */
+    LINE("对她说"),
+
+    /** 无人像画面时值得强调的要点。 */
+    SCENE("画面要点"),
+
+    /** 当前画面存在的具体问题——解释"为什么要改"，不是动作本身。 */
+    ISSUE("问题"),
+}
+
+data class HintStep(
+    val kind: HintKind,
+    val text: String,
+)

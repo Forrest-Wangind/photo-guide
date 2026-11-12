@@ -59,6 +59,7 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
@@ -73,6 +74,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.photoguide.capture.CameraFacing
 import com.photoguide.capture.CameraState
 import com.photoguide.capture.CameraViewfinder
 import com.photoguide.capture.CapturedPhoto
@@ -81,11 +83,16 @@ import com.photoguide.decision.ScenePreset
 import com.photoguide.decision.ShootingIntent
 import com.photoguide.guide.CompositionGuide
 import com.photoguide.guide.GuideRecommendation
+import com.photoguide.guide.GuideSource
 import com.photoguide.platform.excludeFromSystemGestures
 import com.photoguide.state.AnalysisPhase
 import com.photoguide.state.AppState
+import com.photoguide.util.decodeImageBitmapOrNull
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -94,10 +101,24 @@ fun CameraScreen(state: AppState) {
     val controller = rememberCaptureController()
     val cameraState by controller.state
     val canCapture by controller.canCapture
+    val facing by controller.facing
+    val canSwitchFacing by controller.canSwitchFacing
+    val cameraNotice by controller.notice
     val focusManager = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     var lastPhoto by remember { mutableStateOf<CapturedPhoto?>(null) }
     var lastError by remember { mutableStateOf<String?>(null) }
+    // 建议卡里的缩略图 / 预览原图：随 lastPhoto 解码。
+    // 解码 ~700KB JPEG 是阻塞操作，放 IO 线程；失败返回 null，卡片降级成"无图"，
+    // 建议文字照常（decodeImageBitmapOrNull 内部已留日志）。
+    var capturedBitmap by remember { mutableStateOf<ImageBitmap?>(null) }
+    var photoPreviewOpen by remember { mutableStateOf(false) }
+
+    LaunchedEffect(lastPhoto) {
+        capturedBitmap = lastPhoto?.bytes?.let { bytes ->
+            withContext(Dispatchers.Default) { decodeImageBitmapOrNull(bytes) }
+        }
+    }
     // 输入框是否持有焦点。用来决定"点空白"那一层要不要存在——
     // 键盘弹着的时候必须接住空白点击，否则用户只能去按键盘上的"完成"才能收键盘。
     var inputFocused by remember { mutableStateOf(false) }
@@ -206,7 +227,7 @@ fun CameraScreen(state: AppState) {
                     fontSize = 17.sp,
                 )
                 Text(
-                    text = cameraStateLabel(cameraState),
+                    text = cameraStateLabel(cameraState, facing),
                     color = statusColor(cameraState),
                     fontSize = 12.sp,
                 )
@@ -227,8 +248,17 @@ fun CameraScreen(state: AppState) {
         }
 
         // ---------- 失败/降级横幅（绝不静默失败） ----------
+        // 三个来源合并：分析失败、拍照失败、切换镜头失败。
+        // 切换失败常常是"已回滚到原镜头"（预览仍是好的），用 CameraState.Failed
+        // 会谎报"相机不可用"，所以它走独立通道 —— 但**必须**显示出来。
+        //
+        // 多个错误同时在场时（例如"端点没配"的横幅还挂着，又拍了一张但相册保存失败），
+        // 主位只能放优先级最高的那个，另一个必须在下方补一行 —— 静默丢掉任何一个都算谎报。
         val failure = state.failure
-        val bannerText = failure?.message ?: lastError
+        val bannerText = failure?.message ?: lastError ?: cameraNotice
+        val secondaryNotice = cameraNotice.takeIf {
+            bannerText != null && cameraNotice != null && bannerText != cameraNotice
+        }
         if (bannerText != null) {
             Box(
                 modifier = Modifier
@@ -252,6 +282,14 @@ fun CameraScreen(state: AppState) {
                         color = MaterialTheme.colorScheme.onError,
                         fontSize = 13.sp,
                     )
+                    if (secondaryNotice != null) {
+                        Text(
+                            text = "⚠ $secondaryNotice",
+                            color = MaterialTheme.colorScheme.onError,
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
                     if (failure?.kind?.isRetryable == true) {
                         Text(
                             text = "点这里重试",
@@ -300,6 +338,13 @@ fun CameraScreen(state: AppState) {
                     expanded = hintExpanded,
                     onExpandedChange = { hintExpanded = it },
                     onDismiss = state::dismissHint,
+                    // 拍照后"该开哪条线"由本次建议决定，卡片里必须给出入口 ——
+                    // 否则线突然多出来几条，用户不知道是哪儿来的。
+                    // 手动锁定过就不展示：那是用户自己选的，卡片不该再劝他换。
+                    guide = state.guideRecommendation.takeIf { state.guideIsAuto },
+                    onGuideClick = { guidePickerOpen = true },
+                    photo = capturedBitmap,
+                    onPhotoClick = { photoPreviewOpen = true },
                 )
             }
         }
@@ -406,12 +451,18 @@ fun CameraScreen(state: AppState) {
                     .padding(vertical = 10.dp),
                 contentAlignment = Alignment.Center,
             ) {
+                // 快门本体承载了两个手势：点 = 拍照，左右滑 = 换镜头（详见 CaptureButton 注释）。
+                // 切换入口放进快门后，右下角不再需要独立按钮 —— 底部清爽了，
+                // 快门也仍能保持绝对居中（构图参考线依赖这一点）。
                 CaptureButton(
                     enabled = canCapture && state.phase != AnalysisPhase.ANALYZING,
                     analyzing = state.phase == AnalysisPhase.ANALYZING,
+                    facing = facing,
+                    canSwitch = canSwitchFacing,
                     onClick = {
                         lastError = null
                         state.dismissFailure()
+                        controller.clearNotice()
                         controller.capture(
                             onResult = { photo ->
                                 lastPhoto = photo
@@ -419,6 +470,10 @@ fun CameraScreen(state: AppState) {
                             },
                             onError = { msg -> lastError = msg },
                         )
+                    },
+                    onSwitchFacing = {
+                        // 切镜头是纯相机动作：不改意图、不改参考线状态。
+                        controller.switchFacing()
                     },
                 )
             }
@@ -438,31 +493,112 @@ fun CameraScreen(state: AppState) {
                     .padding(top = 64.dp, end = 6.dp),
             )
         }
+
+        // ---------- 原图预览浮层 ----------
+        // 最后声明 = z 序最高：预览时盖住取景器/卡片/调试面板的一切，
+        // 它是全屏交互（缩放/平移），底下任何东西都不该穿透响应。
+        val previewBitmap = capturedBitmap
+        if (photoPreviewOpen && previewBitmap != null) {
+            PhotoPreviewOverlay(
+                bitmap = previewBitmap,
+                onClose = { photoPreviewOpen = false },
+            )
+        }
     }
 }
 
+/**
+ * 快门：**点击拍照，左右滑切换前后镜头**。
+ *
+ * 为什么不再用独立按钮：那块位置（右下角）常驻占地方，而"换镜头"是低频动作 ——
+ * 一次拍摄通常只在开头定一次，之后整场都在按快门。把手势搭在快门上，
+ * 底部只剩一个控件，视觉上也更像相机。
+ *
+ * 三个必须讲清的点：
+ *
+ * ① **点与滑不会互相误触**：位移超过 touch slop 后横向拖动检测器会消费事件，
+ *    clickable 的 tap 随之取消；轻点则 drag 检测器永远等不到 slop，拍照正常。
+ *
+ * ② **拖动要跟手**：`Animatable` + 在 `offset{}` 里读值 —— 只有 layout 阶段失效，
+ *    拖动 60fps 不会重组整页（与意图面板同一条纪律）。`snapTo` 必须 UNDISPATCHED，
+ *    默认 launch 会排队到下一帧，同帧的多个事件全读到旧值（表现为"手指走了按钮没跟"）。
+ *
+ * ③ **松手看净位移，不看方向**：向左滑、向右滑都是"切到另一颗" ——
+ *    前置/后置与左右没有天然映射，硬指定方向只会让人记错。
+ *    位移不足阈值视为误触，弹回原位不切换。
+ *
+ * 单摄设备（部分平板）`canSwitch=false` 时**根本不挂拖动检测器**：拖不动，
+ * 也不会莫名其妙切一次。标签同时降级成只显示镜头名（不再提示可滑）。
+ */
 @Composable
-private fun CaptureButton(enabled: Boolean, analyzing: Boolean, onClick: () -> Unit) {
+private fun CaptureButton(
+    enabled: Boolean,
+    analyzing: Boolean,
+    facing: CameraFacing,
+    canSwitch: Boolean,
+    onClick: () -> Unit,
+    onSwitchFacing: () -> Unit,
+) {
     val ring = if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
-    Box(
-        modifier = Modifier
-            .size(72.dp)
-            .clip(CircleShape)
-            .border(3.dp, ring, CircleShape)
-            .clickable(enabled = enabled, onClick = onClick),
-        contentAlignment = Alignment.Center,
-    ) {
+    val scope = rememberCoroutineScope()
+    val dragX = remember { Animatable(0f) }
+    val threshold = 40.dp
+    val maxTravel = 56.dp
+
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Box(
             modifier = Modifier
-                .size(if (analyzing) 26.dp else 56.dp)
+                .offset { IntOffset(dragX.value.roundToInt(), 0) }
+                .size(72.dp)
                 .clip(CircleShape)
-                .background(if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline),
+                .border(3.dp, ring, CircleShape)
+                .clickable(enabled = enabled, onClick = onClick)
+                .pointerInput(canSwitch) {
+                    if (!canSwitch) return@pointerInput
+                    val thresholdPx = threshold.toPx()
+                    val maxPx = maxTravel.toPx()
+                    fun settle() = scope.launch {
+                        dragX.animateTo(0f, tween(180, easing = FastOutSlowInEasing))
+                    }
+                    detectHorizontalDragGestures(
+                        onDragEnd = {
+                            val passed = abs(dragX.value) >= thresholdPx
+                            settle()
+                            if (passed) onSwitchFacing()
+                        },
+                        onDragCancel = { settle() },
+                        onHorizontalDrag = { change, amount ->
+                            change.consume()
+                            scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                                dragX.snapTo((dragX.value + amount).coerceIn(-maxPx, maxPx))
+                            }
+                        },
+                    )
+                },
             contentAlignment = Alignment.Center,
         ) {
-            if (analyzing) {
-                Text("…", color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold)
+            Box(
+                modifier = Modifier
+                    .size(if (analyzing) 26.dp else 56.dp)
+                    .clip(CircleShape)
+                    .background(if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (analyzing) {
+                    Text("…", color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold)
+                }
             }
         }
+
+        // 镜头标签：两颗镜头对着同一面墙时画面几乎没有变化，没有文字就无从确认切没切成功。
+        // 它同时是**唯一的手势提示** —— "能左右滑"这件事不写出来没人会去试。
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = if (canSwitch) "${facing.displayName} · 左右滑切换" else facing.displayName,
+            color = Color.White.copy(alpha = if (canSwitch) 0.72f else 0.42f),
+            fontSize = 10.sp,
+            maxLines = 1,
+        )
     }
 }
 
@@ -825,11 +961,15 @@ private fun GuidePicker(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             item {
-                // 自动档把"替我选了哪一条"写在 chip 上，而不是只写"自动"再让用户去猜
-                val autoLabel = if (auto && recommendation != null) {
-                    "自动·${recommendation.guide.displayName}"
-                } else {
-                    "自动"
+                // 自动档把"替我选了哪一条"写在 chip 上，而不是只写"自动"再让用户去猜。
+                // 拍完照之后推荐来自**本次建议**，措辞也要跟着变 ——
+                // 否则用户会以为这条线是"按我选的场景猜的"，而不是"看了这张照片给的"。
+                val autoLabel = when {
+                    !auto -> "自动"
+                    recommendation == null -> "自动"
+                    recommendation.source == GuideSource.INTENT ->
+                        "自动·${recommendation.guide.displayName}"
+                    else -> "建议·${recommendation.guide.displayName}"
                 }
                 FilterChip(
                     selected = auto,
@@ -874,15 +1014,20 @@ private fun guideNotice(
 
     !auto -> "${effective.tip}（已锁定：换场景不会自动改）"
 
+    // 拍照后的推荐：说清"这是按这张照片的建议挑的"，而不是"按你的意图猜的"
+    recommendation != null && recommendation.source != GuideSource.INTENT ->
+        "根据本次建议 · ${recommendation.guide.displayName} —— ${recommendation.reason}"
+
     recommendation != null ->
         "自动 · ${recommendation.guide.displayName} —— ${recommendation.reason}"
 
     else -> "当前意图没有明确对应的参考线，所以不画。点其它档位可手动锁定"
 }
 
-private fun cameraStateLabel(s: CameraState): String = when (s) {
+// 镜头名必须跟着状态走：切完镜头不看顶栏就无从确认（尤其两颗镜头对着同一面墙时）
+private fun cameraStateLabel(s: CameraState, facing: CameraFacing): String = when (s) {
     is CameraState.Starting -> "相机启动中…"
-    is CameraState.Ready -> "相机就绪"
+    is CameraState.Ready -> "相机就绪 · ${facing.displayName}"
     is CameraState.Failed -> if (s.permissionDenied) "未授予相机权限" else "相机不可用"
 }
 

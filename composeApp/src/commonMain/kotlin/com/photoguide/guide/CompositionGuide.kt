@@ -65,4 +65,22 @@ enum class CompositionGuide(
         "四周留 8% 余量，后期裁切不丢关键内容",
         "安全框：四周内缩 8% 的方框，框内才是后期裁切后仍然保留的区域（是裁切提示，不是构图线）",
     ),
+    ;
+
+    companion object {
+        /**
+         * 把模型返回的字符串解析成枚举。
+         *
+         * 模型不一定老实返回 `THIRDS` 这种 name，也可能返回中文名（"三分线"）。
+         * 两种都认，认不出返回 **null** —— 让调用方回退到本地规则，
+         * 而不是默默当成"关闭"（那等于把模型的口误翻译成"用户不想看线"）。
+         */
+        fun fromWire(raw: String?): CompositionGuide? {
+            val v = raw?.trim().orEmpty()
+            if (v.isEmpty()) return null
+            return entries.firstOrNull {
+                it.name.equals(v, ignoreCase = true) || it.displayName == v
+            }
+        }
+    }
 }

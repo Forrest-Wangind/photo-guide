@@ -16,10 +16,25 @@ import androidx.compose.ui.Modifier
 class FakeCaptureController : CaptureController {
     private val _state = mutableStateOf<CameraState>(CameraState.Ready)
     private val _canCapture = mutableStateOf(true)
+    private val _facing = mutableStateOf(CameraFacing.BACK)
+    private val _canSwitch = mutableStateOf(true)
+    private val _notice = mutableStateOf<String?>(null)
     private val tick = mutableStateOf(0)
 
     override val state: State<CameraState> get() = _state
     override val canCapture: State<Boolean> get() = _canCapture
+    override val facing: State<CameraFacing> get() = _facing
+    override val canSwitchFacing: State<Boolean> get() = _canSwitch
+    override val notice: State<String?> get() = _notice
+
+    override fun clearNotice() {
+        _notice.value = null
+    }
+
+    override fun switchFacing() {
+        _notice.value = null
+        _facing.value = _facing.value.other
+    }
 
     override fun capture(onResult: (CapturedPhoto) -> Unit, onError: (String) -> Unit) {
         tick.value += 1

@@ -44,6 +44,7 @@ import com.photoguide.llm.LlmConfig
 import com.photoguide.llm.ProviderCatalog
 import com.photoguide.perception.PerceptionRegistry
 import com.photoguide.state.AppState
+import com.photoguide.state.MAX_HISTORY
 
 /**
  * 设置页。
@@ -132,6 +133,25 @@ fun SettingsScreen(state: AppState) {
                 }
                 .padding(16.dp),
         ) {
+
+            // -------------------- 拍摄记录（二级入口） --------------------
+            // ⭐ 一级界面（相机页）**不再新增按钮**（2026-11-12 用户定）：顶栏固定为
+            // 「标题 + 构图 + 调试 + 设置」。再加一个就会把标题压成省略号，而且
+            // "翻历史"是低频动作，不该在取景时占一格。
+            //
+            // 收纳位置选设置页**最顶部的一行**，不是最底部：历史入口如果要翻一屏半
+            // 才找得到，等于没有。一行紧凑卡片既不打乱下面"模型服务"的配置顺序，
+            // 也不用滚动就能看见。
+            HistoryEntryRow(
+                count = state.history.size,
+                onClick = {
+                    dismissKeyboard()
+                    state.openHistory()
+                },
+            )
+            Spacer(Modifier.height(14.dp))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+            Spacer(Modifier.height(14.dp))
 
             // -------------------- 模型服务 --------------------
             // ⭐ 这里只有一个概念：**端点列表**。内置两家（DeepSeek / Claude）与用户新建的
@@ -448,6 +468,45 @@ fun SettingsScreen(state: AppState) {
             )
             Spacer(Modifier.height(24.dp))
         }
+    }
+}
+
+/**
+ * 设置页顶部的「拍摄记录」入口。
+ *
+ * 为什么是一个整行、而不是塞进上面那排 chip 或做成一个图标：这一行的用途是
+ * "说明这是什么 + 现在有几条"，一行字正好说清，也不用用户去猜图标含义。
+ * 条数为 0 时文案改成"还没有记录"，避免点了进去才发现是空页。
+ */
+@Composable
+private fun HistoryEntryRow(count: Int, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = "拍摄记录",
+                color = MaterialTheme.colorScheme.onSurface,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = if (count == 0) {
+                    "还没有记录 · 拍完自动留下最近 $MAX_HISTORY 条"
+                } else {
+                    "最近 $count/$MAX_HISTORY 条 · 缩略图 + 当时的全部提示"
+                },
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 11.sp,
+            )
+        }
+        Text("查看 ›", color = MaterialTheme.colorScheme.primary, fontSize = 12.sp)
     }
 }
 

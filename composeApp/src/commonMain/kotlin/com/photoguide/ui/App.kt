@@ -22,6 +22,11 @@ fun App() {
                 if (state.showSettings) {
                     SettingsScreen(state)
                 }
+                // 历史记录放在设置之后：两者都是全屏浮层，历史是更"当前"的查看动作，
+                // 万一同开也要盖在上面
+                if (state.showHistory) {
+                    HistoryScreen(state)
+                }
             }
         }
     }

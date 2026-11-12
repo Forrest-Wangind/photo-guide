@@ -1,5 +1,6 @@
 package com.photoguide.decision
 
+import com.photoguide.guide.CompositionGuide
 import kotlinx.serialization.Serializable
 
 /**
@@ -48,6 +49,21 @@ data class CompositionHint(
     /** 模型不确定的地方。设计原则 3：必须显式标注，不许掩饰。 */
     val warnings: List<String> = emptyList(),
 
+    /**
+     * 模型建议开启的参考线（`CompositionGuide` 的 name 或中文名）。
+     *
+     * 为什么让模型说：它**看过这张照片**，知道主体偏在哪、边缘有没有人被切。
+     * 本地规则只能按"用户说他要拍什么"推，拍完拿到的是"画面实际出了什么问题"，
+     * 后者才是选参考线的真正依据。
+     *
+     * ⚠️ 这里存**原始字符串**而不是枚举：反序列化时不认识的值要能被上层看见并回退，
+     * 直接映射成枚举会在解析失败时静默变成"关闭"。解析统一走 [suggestedGuideOrNull]。
+     */
+    val suggestedGuide: String? = null,
+
+    /** 为什么是这条线（一句，UI 原样展示）。空 = 模型没给理由。 */
+    val guideReason: String = "",
+
     val confidence: Double? = null,
 ) {
     /** 画面里有人物 → 右栏用"对她说"；否则用"画面要点"。 */
@@ -56,6 +72,15 @@ data class CompositionHint(
     /** 右栏实际要展示的内容。 */
     val secondColumnLines: List<String>
         get() = if (hasPerson) modelLines else sceneNotes
+
+    /**
+     * 模型建议的参考线；没建议 / 建议"关闭" / 值认不出 → null。
+     *
+     * 三者在**行为上等价**（都不画线），不做区分：多一个"模型说关闭了"的状态
+     * 只会让 UI 多一条分支，却不改变任何结果。
+     */
+    val suggestedGuideOrNull: CompositionGuide?
+        get() = CompositionGuide.fromWire(suggestedGuide)?.takeIf { it != CompositionGuide.NONE }
 
     val hasContent: Boolean
         get() = headline.isNotBlank() ||

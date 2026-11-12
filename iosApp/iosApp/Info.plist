@@ -27,6 +27,10 @@
 	<key>NSCameraUsageDescription</key>
 	<string>需要用相机取景并拍摄照片，才能给出构图建议。照片仅发送到你自己配置的大模型接口。</string>
 
+	<!-- 必填：拍照后自动存入相册（只写不读，因此用 Add-only 授权） -->
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>拍照后会把照片存进相册，方便你回看和留存。</string>
+
 	<!-- 允许 http 明文端点（本地跑 vLLM / One-API 网关时会用到） -->
 	<key>NSAppTransportSecurity</key>
 	<dict>

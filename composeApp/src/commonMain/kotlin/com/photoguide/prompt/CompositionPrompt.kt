@@ -1,6 +1,7 @@
 package com.photoguide.prompt
 
 import com.photoguide.decision.ShootingIntent
+import com.photoguide.guide.CompositionGuide
 import com.photoguide.llm.LlmConfig
 import com.photoguide.perception.PerceptionSnapshot
 import kotlinx.serialization.json.Json
@@ -65,6 +66,17 @@ object CompositionPrompt {
   正例："把台灯往左挪 10 厘米，让光从侧面扫过茶杯"、"退半步把门框带进画面右侧当边框"。
 - 如果画面已经足够好，就直接说"这样就行，按快门"，不要硬凑问题。
 - 你不确定的地方，写进 warnings，禁止编造。宁可少说，不要胡说。
+
+除了文字建议，你还要顺手替用户挑一个**取景参考线**（suggestedGuide）：
+他能把这套线叠加在取景器上，看着线调整位置。只能填下面七个值之一：
+  THIRDS（三分线）/ GOLDEN（黄金分割）/ CENTER（中心十字）/
+  DIAGONAL（对角线）/ SPIRAL（黄金螺旋）/ SAFE_FRAME（安全框）/ NONE（不需要）
+- 挑**最能解决你上面指出的主要问题**的那一条，不是挑"听起来高级"的；
+- 画面里主体明确、只是位置偏 → 三分线；人群容易被裁到 → 安全框；
+  已经对称的场景（倒影、正面证件照）→ 中心十字；斜向的桌面/盘沿 → 对角线；
+  人物很小、要引导视线 → 黄金螺旋；主体偏一点才有层次 → 黄金分割；
+- 问题在光线、表情、曝光、时机这些**画线帮不上忙**的地方 → 填 NONE，不要硬选；
+- guideReason 用一句中文说清"这条线解决什么"，不超过 20 字，会原样展示给用户。
 - 只输出 JSON，不要 markdown 代码块，不要任何 JSON 之外的文字。
 """.trimIndent()
 
@@ -77,6 +89,8 @@ object CompositionPrompt {
   "sceneNotes": ["无人像画面时的强化要点，1-3 条。画面里有人物时必须为 []"],
   "issues": ["当前画面具体存在的问题，0-3 条"],
   "warnings": ["你不确定的地方，0-3 条。没有就给空数组"],
+  "suggestedGuide": "THIRDS|GOLDEN|CENTER|DIAGONAL|SPIRAL|SAFE_FRAME|NONE 之一",
+  "guideReason": "为什么是这条线，不超过 20 字",
   "confidence": 0.0-1.0
 }
 """.trimIndent()
@@ -95,6 +109,15 @@ object CompositionPrompt {
         perception: PerceptionSnapshot,
         config: LlmConfig,
         imageAttached: Boolean,
+        /**
+         * 取景器上正显示着的参考线。
+         *
+         * 为什么会出现在提示词里：参考线是**画在用户眼前的**，模型不知道它的存在，
+         * 就会说"稍微往左一点"——而用户眼前横着四条三分线，这句话没法核对。
+         * 告诉模型"用户正开着三分线"，它才能说"把她的眼睛放到右上交点"，
+         * 参考线和台词才是一件事，而不是两个各说各话的功能。
+         */
+        guide: CompositionGuide = CompositionGuide.NONE,
     ): String = buildString {
         appendLine("【用户的拍摄意图】")
         val preset = intent.preset
@@ -119,6 +142,30 @@ object CompositionPrompt {
             // 既不选场景也不写字：不能默认成"人像半身"硬凑一套建议
             appendLine("- 用户既没选场景也没写说明。请先根据画面内容判断主体是什么，再给针对性建议；")
             appendLine("  若画面里没有可辨认的明确主体，必须在 warnings 里说明\"本次为通用指引\"。")
+        }
+        appendLine()
+
+        appendLine("【屏幕上的参考线】")
+        if (guide == CompositionGuide.NONE) {
+            appendLine("用户没有开启参考线，画面上没有任何辅助线。")
+            appendLine("位置类建议请用自然语言表达（左/右/上/下、靠近画面边缘、占画面几分之几），")
+            appendLine("**不要**引用\"三分线交点\"\"黄金线\"这类画面上并不存在的参照。")
+            appendLine("这种情况下 suggestedGuide 尤其重要：用户下一张该打开哪条线，由你来推荐。")
+        } else {
+            appendLine("用户正开着「${guide.displayName}」：${guide.promptHint}。")
+            appendLine("这是用户抬眼就能看到的线，所以位置类建议**必须直接引用它**。")
+            appendLine("正例：\"把她的眼睛放到右上交点\"、\"让杯口压在右下那条黄金线上\"、\"往左挪，让她落在左边那条竖线上\"。")
+            appendLine("反例（禁止）：\"稍微往左一点\"\"再靠近一点\"——对不上用户眼前看到的东西。")
+            if (guide == CompositionGuide.SAFE_FRAME) {
+                appendLine("注意：安全框是**裁切**提示，不是构图线。主体仍按常规构图摆放，")
+                appendLine("只需保证关键内容（人脸、手、产品主体）不跑出框外。")
+            }
+            if (guide == CompositionGuide.SPIRAL) {
+                appendLine("黄金螺旋的\"眼睛\"是一个具体落点：请说清主体该落在螺旋中心附近，")
+                appendLine("而不是笼统地让人\"往螺旋方向靠\"。")
+            }
+            appendLine("如果 suggestedGuide 与当前这条不同：文字里的位置建议**仍按当前这条写**")
+            appendLine("（用户眼下只看得见它），suggestedGuide 表达的是\"下一张更该用哪条\"。")
         }
         appendLine()
 

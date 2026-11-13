@@ -1,6 +1,7 @@
 package com.photoguide.decision
 
 import com.photoguide.capture.CapturedPhoto
+import com.photoguide.guide.CompositionGuide
 import com.photoguide.llm.Endpoint
 import com.photoguide.llm.FailureKind
 import com.photoguide.llm.LlmClient
@@ -65,6 +66,11 @@ class HintEngine(private val llmClient: LlmClient) {
         config: LlmConfig,
         /** 本次实际要用的端点（三元组 + 协议族）。不再是 config 的一坨字段。 */
         endpoint: Endpoint,
+        /**
+         * 取景器上正在显示的参考线。传给提示词，让模型的位置建议能引用
+         * 屏幕上真实存在的线（"眼睛放到右上交点"），而不是"稍微往左一点"。
+         */
+        guide: CompositionGuide = CompositionGuide.NONE,
     ): HintOutcome {
         val timer = StageTimer()
 
@@ -89,6 +95,7 @@ class HintEngine(private val llmClient: LlmClient) {
                 perception = snapshot,
                 config = config,
                 imageAttached = imageDataUrl != null,
+                guide = guide,
             ),
             imageDataUrl = imageDataUrl,
             lowDetail = config.lowDetail,

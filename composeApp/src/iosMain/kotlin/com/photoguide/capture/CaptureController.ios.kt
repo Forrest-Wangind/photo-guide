@@ -21,6 +21,8 @@ import platform.AVFoundation.AVAuthorizationStatusNotDetermined
 import platform.AVFoundation.AVCaptureDevice
 import platform.AVFoundation.AVCaptureDeviceInput
 import platform.AVFoundation.AVCaptureDevicePositionBack
+import platform.AVFoundation.AVCaptureDevicePositionFront
+import platform.AVFoundation.AVCaptureDeviceTypeBuiltInWideAngleCamera
 import platform.AVFoundation.AVCapturePhoto
 import platform.AVFoundation.AVCapturePhotoCaptureDelegateProtocol
 import platform.AVFoundation.AVCapturePhotoOutput
@@ -34,7 +36,13 @@ import platform.AVFoundation.authorizationStatusForMediaType
 import platform.AVFoundation.requestAccessForMediaType
 import platform.CoreGraphics.CGRectMake
 import platform.Foundation.NSData
+import platform.Foundation.NSDate
 import platform.Foundation.NSError
+import platform.Foundation.NSFileManager
+import platform.Foundation.NSTemporaryDirectory
+import platform.Foundation.NSURL
+import platform.Photos.PHAssetChangeRequest
+import platform.Photos.PHPhotoLibrary
 import platform.UIKit.UIView
 import platform.darwin.NSObject
 import platform.darwin.dispatch_async
@@ -107,9 +115,15 @@ internal class IosCaptureController : CaptureController {
 
     private val _state = mutableStateOf<CameraState>(CameraState.Starting)
     private val _canCapture = mutableStateOf(false)
+    private val _facing = mutableStateOf(CameraFacing.BACK)
+    private val _canSwitch = mutableStateOf(false)
+    private val _notice = mutableStateOf<String?>(null)
 
     override val state = _state
     override val canCapture = _canCapture
+    override val facing = _facing
+    override val canSwitchFacing = _canSwitch
+    override val notice = _notice
 
     var permissionDenied: Boolean = false
         private set
@@ -117,6 +131,9 @@ internal class IosCaptureController : CaptureController {
     private val session = AVCaptureSession()
     private var photoOutput: AVCapturePhotoOutput? = null
     private var started = false
+
+    /** 当前挂着的输入。切换镜头必须先摘掉旧的 —— 否则 session 会同时挂两颗，第二颗必然被拒。 */
+    private var currentInput: AVCaptureDeviceInput? = null
 
     /** 一次性持有 delegate，否则会被 GC 掉导致回调丢失。 */
     private var pendingDelegate: Any? = null
@@ -128,6 +145,23 @@ internal class IosCaptureController : CaptureController {
     init {
         configure()
     }
+
+    override fun clearNotice() {
+        _notice.value = null
+    }
+
+    /**
+     * 取指定朝向的广角镜头。没有就是 null（iPad / 老设备只有一颗）。
+     *
+     * 只用 builtInWideAngle：超广、长焦的 framing 与"所见即所得"差太远，
+     * 混进来会让"参考线画的位置"和"实际画面"对不上。
+     */
+    private fun deviceFor(facing: CameraFacing): AVCaptureDevice? =
+        AVCaptureDevice.defaultDeviceWithDeviceType(
+            AVCaptureDeviceTypeBuiltInWideAngleCamera,
+            if (facing == CameraFacing.BACK) AVCaptureDevicePositionBack else AVCaptureDevicePositionFront,
+            AVMediaTypeVideo,
+        )
 
     private fun configure() {
         val status = AVCaptureDevice.authorizationStatusForMediaType(AVMediaTypeVideo)
@@ -151,9 +185,25 @@ internal class IosCaptureController : CaptureController {
     }
 
     private fun setupSession() {
-        val device = AVCaptureDevice.defaultDeviceWithMediaType(AVMediaTypeVideo)
-        if (device == null) {
+        val back = deviceFor(CameraFacing.BACK)
+        val front = deviceFor(CameraFacing.FRONT)
+        _canSwitch.value = back != null && front != null
+
+        val target = when {
+            _facing.value == CameraFacing.BACK && back != null -> CameraFacing.BACK
+            _facing.value == CameraFacing.FRONT && front != null -> CameraFacing.FRONT
+            back != null -> CameraFacing.BACK
+            front != null -> CameraFacing.FRONT
+            else -> null
+        }
+        if (target == null) {
             _state.value = CameraState.Failed("这台设备上没有可用摄像头")
+            return
+        }
+
+        val device = deviceFor(target)
+        if (device == null) {
+            _state.value = CameraState.Failed("无法获取${target.displayName}摄像头")
             return
         }
 
@@ -171,6 +221,7 @@ internal class IosCaptureController : CaptureController {
             _state.value = CameraState.Failed("相机输入被拒绝，可能设备不可用")
             return
         }
+        currentInput = input
 
         val output = AVCapturePhotoOutput()
         if (session.canAddOutput(output)) {
@@ -183,8 +234,52 @@ internal class IosCaptureController : CaptureController {
         }
 
         session.commitConfiguration()
+        _facing.value = target
         _canCapture.value = true
         _state.value = CameraState.Ready
+    }
+
+    /**
+     * 换镜头：摘旧 input → 挂新 input。
+     *
+     * 不用重建 session（预览层绑的是 session，重建会让画面闪一下并且要重新 startRunning）。
+     * 失败一律回滚到原来那颗，并把原因写进 [notice] —— 静默保持原状等于骗用户"切了"。
+     */
+    override fun switchFacing() {
+        _notice.value = null
+        val target = _facing.value.other
+
+        val device = deviceFor(target)
+        if (device == null) {
+            _canSwitch.value = false
+            _notice.value = "这台设备没有${target.displayName}摄像头"
+            return
+        }
+
+        val newInput = runCatching { AVCaptureDeviceInput.deviceInputWithDevice(device, null) }.getOrNull()
+        if (newInput == null) {
+            _notice.value = "无法启用${target.displayName}摄像头（可能被其它应用占用）"
+            return
+        }
+
+        val old = currentInput
+        session.beginConfiguration()
+        old?.let { session.removeInput(it) }
+
+        if (session.canAddInput(newInput)) {
+            session.addInput(newInput)
+            currentInput = newInput
+            session.commitConfiguration()
+            _facing.value = target
+            _state.value = CameraState.Ready
+            _canCapture.value = true
+            platformLog(TAG, "已切到${target.displayName}摄像头")
+        } else {
+            old?.let { session.addInput(it) }
+            session.commitConfiguration()
+            _notice.value = "切换到${target.displayName}失败（系统拒绝该输入），已保持${_facing.value.displayName}"
+            platformLog(TAG, "切换失败：canAddInput=false")
+        }
     }
 
     /** 启动会话在后台队列做——startRunning() 在主线程会阻塞 UI。 */
@@ -218,6 +313,8 @@ internal class IosCaptureController : CaptureController {
                     rotationDegrees = 0,
                 )
             )
+            // 落地与"分析结果"无关：拍到了就存（Android 侧同一原则）
+            saveToGallery(bytes)
         }
         pendingDelegate = delegate
 
@@ -227,6 +324,57 @@ internal class IosCaptureController : CaptureController {
 
     private companion object {
         const val TAG = "IosCamera"
+    }
+
+    /**
+     * 存进系统相册（Photos framework），与 Android 侧同一条原则：拍到了就存，
+     * 与建议结果无关。
+     *
+     * 路径：临时目录写文件 → `PHAssetChangeRequest.creationRequestForAssetFromImageAtFileURL`。
+     * 之所以走文件而不是 `UIImage`：`CapturedPhoto` 里只有 JPEG 字节，重建 UIImage
+     * 会多一次解码（大图能吃掉几十毫秒），而文件路径是零成本的。
+     *
+     * ⚠️ 本机无 Xcode，cinterop 签名未实测。若 `creationRequestForAssetFromImageAtFileURL`
+     * 或 `NSData.create(bytes:length:)` 报签名不符，按编译器提示换成
+     * `creationRequestForAssetFromImage(image = UIImage(data = data))` 即可，逻辑不动。
+     */
+    private fun saveToGallery(bytes: ByteArray) {
+        val data = bytes.toNSData()
+        if (data == null) {
+            _notice.value = "拍到的照片是空的，没能存进相册"
+            return
+        }
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT.toLong(), 0u)) {
+            val path = NSTemporaryDirectory() + "PhotoGuide_${NSDate().timeIntervalSince1970.toLong()}.jpg"
+            if (!data.writeToFile(path, atomically = true)) {
+                _notice.value = "照片没能写入临时文件，相册未保存"
+                return@dispatch_async
+            }
+            PHPhotoLibrary.sharedPhotoLibrary().performChanges(
+                changeBlock = {
+                    PHAssetChangeRequest.creationRequestForAssetFromImageAtFileURL(
+                        NSURL.fileURLWithPath(path)
+                    )
+                },
+                completionHandler = { success, error ->
+                    // 临时文件用完即删：相册里已经是独立副本
+                    runCatching { NSFileManager.defaultManager.removeItemAtPath(path, null) }
+                    if (!success) {
+                        _notice.value = "照片没能存进相册：${error?.localizedDescription ?: "未知原因"}"
+                        platformLog(TAG, "存入相册失败：${error?.localizedDescription}")
+                    }
+                },
+            )
+        }
+    }
+}
+
+/** ByteArray → NSData。空数组不能取 addressOf(0)，调用前必须判空。 */
+@OptIn(ExperimentalForeignApi::class)
+private fun ByteArray.toNSData(): NSData? {
+    if (isEmpty()) return null
+    return usePinned { pinned ->
+        NSData.create(bytes = pinned.addressOf(0), length = size.toULong())
     }
 }
 

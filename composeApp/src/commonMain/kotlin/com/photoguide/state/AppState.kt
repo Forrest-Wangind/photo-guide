@@ -11,6 +11,9 @@ import com.photoguide.decision.CompositionHint
 import com.photoguide.decision.HintEngine
 import com.photoguide.decision.HintOutcome
 import com.photoguide.decision.ShootingIntent
+import com.photoguide.guide.CompositionGuide
+import com.photoguide.guide.GuideRecommendation
+import com.photoguide.guide.GuideRecommender
 import com.photoguide.llm.Endpoint
 import com.photoguide.llm.FailureKind
 import com.photoguide.llm.LlmClient
@@ -27,9 +30,16 @@ import com.photoguide.platform.createSettingsStore
 import com.photoguide.platform.platformLog
 import com.photoguide.prompt.CompositionPrompt
 import com.photoguide.prompt.PromptTrace
+import com.photoguide.util.Base64
+import com.photoguide.util.THUMB_MAX_DIM
+import com.photoguide.util.THUMB_QUALITY
+import com.photoguide.util.makeThumbnailJpeg
+import com.photoguide.util.nowEpochMs
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.MapSerializer
@@ -111,9 +121,179 @@ class AppState(
     var showDebug by mutableStateOf(false)
         private set
 
+    /**
+     * 底部意图面板是否**收起在左侧**。
+     *
+     * 收起的动机是取景：面板（场景芯片 + 描述输入）常态占掉底部约四分之一屏幕，
+     * 而"看画面"才是这个 App 的主任务。收起后只留左侧一条把手，拍照按钮原地不动 ——
+     * 收起是为了看画面，不是为了不能按快门。
+     *
+     * 落盘：这是"我这阵子都想大屏取景"的偏好，不是一次性的临时动作。
+     */
+    var inputPanelCollapsed by mutableStateOf(loadPanelCollapsed())
+        private set
+
+    /** 面板收起/展开（拖动吸附结束或点击把手时调用）。只需布尔：中间过程是动画值，不该落盘。 */
+    fun updateInputPanelCollapsed(collapsed: Boolean) {
+        if (inputPanelCollapsed == collapsed) return
+        inputPanelCollapsed = collapsed
+        settings.putString(KEY_PANEL_COLLAPSED, if (collapsed) "1" else "0")
+        platformLog(TAG, if (collapsed) "意图面板 → 收起（左侧把手）" else "意图面板 → 展开")
+    }
+
+    /** 默认展开：新用户第一次打开要能看见"选场景/写描述"这件事。 */
+    private fun loadPanelCollapsed(): Boolean {
+        val raw = settings.getString(KEY_PANEL_COLLAPSED) ?: return false
+        return when (raw) {
+            "1" -> true
+            "0" -> false
+            else -> {
+                platformLog(TAG, "未知面板折叠配置「$raw」，回退为展开")
+                false
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- 参考线
+    //
+    // ⚠️ 只存"手动锁定"这一个字段，生效值全部**推导**出来（manualGuide ?: 推荐 ?: NONE）。
+    // 不把"当前生效的参考线"再存一份 —— 那是 2026-10-15 端点三元组踩过的同一个坑：
+    // 同一份值存两份，必然出现"UI 说 A、实际画的是 B"。这里如果另存一份 guide，
+    // 用户一换场景就会出现"面板显示三分线、画面画着中心十字"的不可判定态。
+
+    /**
+     * 用户手动锁定的参考线；**null = 自动**（跟随拍摄意图）。
+     *
+     * 自动是默认：目标用户（不会构图的人）不该先学会"我这场景该用哪条线"才能用上功能。
+     * 手动一旦选定就不再自动改 —— 用户明确表达过的偏好，不该被场景切换悄悄覆盖。
+     */
+    var manualGuide by mutableStateOf(loadManualGuide())
+        private set
+
+    /**
+     * 当前推荐；null 表示没有明确适用的线（不硬推）。
+     *
+     * 拍照后 [hint] 有值，推荐会先看**这条建议本身**（模型看过画面），
+     * 再退回按意图猜 —— 所以拍完一张，"该开哪条线"的依据从"你想拍什么"
+     * 变成"这张画面实际出了什么问题"。
+     *
+     * ⚠️ 这里刻意**不缓存**成字段：hint / intent 任一变化都应该立刻反映。
+     * 缓存一份推导值就又回到"同一件事存两份"的老坑。
+     */
+    val guideRecommendation: GuideRecommendation?
+        get() = GuideRecommender.recommend(intent, hint)
+
+    /** 正在自动模式下，且确实推荐出了东西。 */
+    val guideIsAuto: Boolean get() = manualGuide == null
+
+    /** 当前实际生效的参考线 —— UI 与绘制层都只读这一个。 */
+    val guide: CompositionGuide
+        get() = manualGuide ?: guideRecommendation?.guide ?: CompositionGuide.NONE
+
+    // ---------------------------------------------------------------- 历史记录
+    //
+    // 边界（2026-11-12 用户拍板）：**不进数据库，最多 20 条**。
+    // 所以整份历史就是一个 JSON 列表，塞在已有的 SettingsStore 里，跟参考线、
+    // 面板折叠状态同一个存储面。不引 Room/SQLDelight：20 条、只追加、整体重写，
+    // 一次序列化几十毫秒都不到，为它维护一套 schema 迁移是纯负担。
+    //
+    // 只存"分析成功"的那些 —— 失败没有建议可回看，记下来只是一堆报错。
+
+    var history by mutableStateOf(loadHistory())
+        private set
+
+    var showHistory by mutableStateOf(false)
+        private set
+
+    fun openHistory() {
+        if (showHistory) return
+        showHistory = true
+        platformLog(TAG, "打开历史记录：${history.size}/$MAX_HISTORY 条")
+    }
+
+    fun closeHistory() {
+        showHistory = false
+    }
+
+    /** 清空历史（UI 侧有二次确认）。清完连键一起删，不留一个 `[]` 在盘上。 */
+    fun clearHistory() {
+        if (history.isEmpty()) return
+        val n = history.size
+        history = emptyList()
+        settings.remove(KEY_HISTORY)
+        platformLog(TAG, "历史记录已清空（$n 条）")
+    }
+
+    private fun loadHistory(): List<HistoryEntry> {
+        val raw = settings.getString(KEY_HISTORY) ?: return emptyList()
+        val decoded = runCatching {
+            json.decodeFromString(ListSerializer(HistoryEntry.serializer()), raw)
+        }.getOrElse {
+            // 绝不静默失败：坏了就说坏了，按空历史继续 —— 但**不**顺手把原文抹掉，
+            // 万一之后想排查，数据还在盘上（下一次成功拍摄才会覆盖它）
+            platformLog(TAG, "历史记录反序列化失败，按空历史处理（原文 ${raw.length} 字符未删除）：${it.message}")
+            return emptyList()
+        }
+        // 倒序 + 截断：上限改小过、或手改过存储时，都不会让列表超长
+        return decoded.sortedByDescending { it.id }.take(MAX_HISTORY)
+    }
+
+    private fun persistHistory() {
+        val encoded = json.encodeToString(ListSerializer(HistoryEntry.serializer()), history)
+        settings.putString(KEY_HISTORY, encoded)
+    }
+
+    /**
+     * 把一条成功的建议写入历史。
+     *
+     * 缩略图丢到 [Dispatchers.Default] 做：解码 + 缩放 + JPEG 编码是几十毫秒的纯 CPU 活，
+     * 留在主线程会正好卡在"建议卡刚出现、用户开始读第一句"的那一帧上。
+     * 生成失败不阻断入库（[HistoryEntry.thumbBase64] 为 null，列表显示"无图"）。
+     */
+    private suspend fun recordHistory(
+        photo: CapturedPhoto,
+        hint: CompositionHint,
+        intentAtShot: ShootingIntent,
+        guideAtShot: CompositionGuide,
+    ) {
+        val thumb = withContext(Dispatchers.Default) {
+            runCatching { makeThumbnailJpeg(photo.bytes, THUMB_MAX_DIM, THUMB_QUALITY) }
+                .onFailure {
+                    platformLog(TAG, "历史缩略图生成失败：${it::class.simpleName} ${it.message.orEmpty()}")
+                }
+                .getOrNull()
+        }
+
+        // id 严格递增：列表 key 用它，Compose 的 LazyColumn 遇到重复 key 会直接崩。
+        // 连拍两帧落在同一毫秒的概率虽低，但没有理由把正确性押在概率上。
+        val id = maxOf(nowEpochMs(), (history.firstOrNull()?.id ?: 0L) + 1L)
+        val entry = HistoryEntry(
+            id = id,
+            createdAtMs = id,
+            headline = hint.headline,
+            score = hint.score,
+            sceneLabel = sceneLabelOf(intentAtShot),
+            freeText = intentAtShot.freeText,
+            guideLabel = guideAtShot.takeIf { it != CompositionGuide.NONE }?.displayName.orEmpty(),
+            modelLabel = activeEndpoint.model,
+            hint = hint,
+            thumbBase64 = thumb?.let { Base64.encode(it) },
+        )
+        history = (listOf(entry) + history).take(MAX_HISTORY)
+        persistHistory()
+        platformLog(
+            TAG,
+            "历史 +1：共 ${history.size}/$MAX_HISTORY 条" +
+                if (thumb == null) "（缩略图生成失败，列表显示无图）" else "（缩略图 ${thumb.size / 1024}KB）",
+        )
+    }
+
     val trend = LatencyTrend()
 
     private var job: Job? = null
+
+    /** 上一次打过日志的自动推荐（"来源:档位"），仅用于去重（不参与任何判断）。 */
+    private var lastAutoLogged: String? = null
 
     // ---------------------------------------------------------------- 配置
 
@@ -452,6 +632,7 @@ class AppState(
     // JVM setter 撞签名（Platform declaration clash）。用 update* / select*。
     fun updateIntent(new: ShootingIntent) {
         intent = new
+        logAutoGuideChange()
     }
 
     fun selectPerception(id: String) {
@@ -477,6 +658,7 @@ class AppState(
             ),
             config = config,
             imageAttached = config.sendImage,
+            guide = guide,
         ),
         imageAttached = config.sendImage,
         model = activeEndpoint.model,
@@ -507,10 +689,16 @@ class AppState(
         lastPhotoInfo = "$photo"
         timings = emptyList()
 
+        // 意图与参考线在**发起这一刻**取快照：分析跑起来之后用户还可能改芯片/改描述，
+        // 提示词里必须描述"这张照片拍的时候是怎么设定的"，不能中途被改掉。
+        val intentSnapshot = intent
+        val guideSnapshot = guide
+
         job = scope.launch {
             val outcome = engine.analyze(
                 photo = photo,
-                intent = intent,
+                intent = intentSnapshot,
+                guide = guideSnapshot,
                 perception = currentPerception(),
                 config = config,
                 endpoint = endpoint,
@@ -523,11 +711,19 @@ class AppState(
                     lastPrompt = outcome.prompt
                     trend.add(outcome.totalMs)
                     phase = AnalysisPhase.DONE
+                    // 建议到手 → 参考线推荐从"按意图猜"切到"按这张画面判"。
+                    // 手动锁定过的不受影响（logAutoGuideChange 里直接返回）。
+                    logAutoGuideChange()
                     platformLog(
                         TAG,
                         "完成：总 ${outcome.totalMs}ms（网络 ${outcome.networkMs}ms）" +
                             outcome.timings.joinToString(prefix = " | ") { "${it.stage}=${it.ms}ms" },
                     )
+                    // 建议到手即入库，与"卡片还开着吗"解耦：用户关掉卡片，记录照样留着。
+                    // 用快照而不是当前的 intent/guide —— 记录必须还原"这张照片拍的时候怎么设定的"。
+                    // 写历史失败只记日志：它是旁路功能，不能反过来把一次成功的分析弄成崩溃。
+                    runCatching { recordHistory(photo, outcome.hint, intentSnapshot, guideSnapshot) }
+                        .onFailure { platformLog(TAG, "历史写入失败（不影响本次建议）：${it.message}") }
                 }
 
                 is HintOutcome.Failure -> {
@@ -560,6 +756,56 @@ class AppState(
     fun closeSettings() { showSettings = false }
     fun toggleDebug() { showDebug = !showDebug }
 
+    // ---------------------------------------------------------------- 参考线
+
+    /** 手动选定一条参考线（含"关闭"）。选完即进入锁定态，换场景不再自动改。 */
+    fun selectGuide(new: CompositionGuide) {
+        if (manualGuide == new) return
+        manualGuide = new
+        settings.putString(KEY_GUIDE, new.name)
+        platformLog(TAG, "参考线 → ${new.displayName}（手动锁定）")
+    }
+
+    /** 回到自动模式：跟随意图推荐。已经自动时幂等返回。 */
+    fun useAutoGuide() {
+        if (manualGuide == null) return
+        manualGuide = null
+        settings.putString(KEY_GUIDE, GUIDE_AUTO)
+        platformLog(TAG, "参考线 → 自动（当前推荐：${guideRecommendation?.guide?.displayName ?: "无"}）")
+    }
+
+    /**
+     * 读不到 / 认不出（枚举改名、脏数据）就回退**自动**，但必须留痕：
+     * 静默回退会让"我明明锁了三分线"变成无法解释的灵异事件。
+     */
+    private fun loadManualGuide(): CompositionGuide? {
+        val raw = settings.getString(KEY_GUIDE) ?: return null
+        if (raw == GUIDE_AUTO) return null
+        return CompositionGuide.entries.firstOrNull { it.name == raw } ?: run {
+            platformLog(TAG, "未知参考线配置「$raw」，回退为自动")
+            null
+        }
+    }
+
+    /**
+     * 自动模式下推荐变了 → 打一行日志（意图变化、或拿到新的拍摄建议）。
+     *
+     * 只在 [updateIntent] 与分析成功两个时机调用（**不要**放进 `guide` 的 getter：
+     * 那是每次重组都会跑的路径）。记录 key 是为了避免"同一个推荐每敲一个字就打一行"。
+     */
+    private fun logAutoGuideChange() {
+        if (manualGuide != null) return
+        val rec = GuideRecommender.recommend(intent, hint)
+        val key = rec?.let { "${it.source}:${it.guide.name}" }
+        if (key == lastAutoLogged) return
+        lastAutoLogged = key
+        if (rec == null) {
+            platformLog(TAG, "参考线自动 → 无（当前意图没有明确对应的线）")
+        } else {
+            platformLog(TAG, "参考线自动 → ${rec.guide.displayName}［${rec.source}］（${rec.reason}）")
+        }
+    }
+
     fun shutdown() {
         job?.cancel()
         llmClient.close()
@@ -571,6 +817,23 @@ class AppState(
 
         /** 端点列表（唯一真相源）。 */
         const val KEY_ENDPOINTS = "endpoints_v1"
+
+        /** 参考线：手动锁定的枚举 name，或 [GUIDE_AUTO]。 */
+        const val KEY_GUIDE = "composition_guide_v1"
+
+        /** "自动"的落盘值。用字面量而不是枚举 name，避免与将来可能的枚举项撞名。 */
+        const val GUIDE_AUTO = "AUTO"
+
+        /** 底部意图面板是否收起（"1"/"0"）。 */
+        const val KEY_PANEL_COLLAPSED = "input_panel_collapsed_v1"
+
+        /**
+         * 历史记录（JSON 数组，最多 [MAX_HISTORY] 条，含缩略图 base64）。
+         *
+         * 刻意**不做分批存 / 不拆成 per-entry 键**：拆开就要维护"哪些缩略图键已经没人引用"，
+         * 20 条的规模下整份重写更简单且不会漏删。
+         */
+        const val KEY_HISTORY = "photo_history_v1"
 
         // 下面两个是**只读**的旧格式 key：仅用于一次性迁移，不再写入。
         // 刻意不删旧键 —— 万一迁移逻辑有问题，用户的数据还在，可以回滚排查。

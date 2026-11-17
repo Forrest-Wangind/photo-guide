@@ -19,17 +19,25 @@
 
 ## 当前状态
 
-**Phase 1 已开工并构建通过**（2026-10-14）。
+**Phase 1 功能闭环已跑通**：Android 真机端到端 + iOS 出包均已实测通过。
+下表基于 **`feature/wangyayun/supportIosModule` 分支、2026-11-17 15:30 后实测**
+（该分支把 CMP 降到 1.8.2 并补了 cinterop import；**main 分支仍编译不过**，见 §已知限制）。
 
-| 项 | 结果 |
+| 项 | 结果（本次实测） |
 |---|---|
-| Android 构建 | ✅ `BUILD SUCCESSFUL`，产物 `composeApp-debug.apk`（15.7 MB） |
-| 源码量 | Kotlin 36 个文件 / 2979 行 |
-| iOS — Kotlin 侧 | ✅ **已编译 + 链接通过**（`iosArm64` debug framework，211 MB，CMP 1.8.2） |
-| iOS — Xcode 工程 | ✅ 已生成（`.xcodeproj` + 共享 scheme）；Swift 侧编译通过，`import ComposeApp` 打通 |
-| iOS — 出包 | ✅ **Debug iphoneos App 链接通过**（Xcode 14.2 / iOS 16.2 SDK） |
-| iOS — 运行 | ✅ 已在 iPhone 14 模拟器启动，相机权限弹窗正常；相机链路仍需真机 |
-| 阻塞项 | 缺一台 iPhone 真机（相机必须真机）和一个 DeepSeek API Key |
+| 当前分支 | `feature/wangyayun/supportIosModule`（CMP **1.8.2**；main 是 1.11.1） |
+| Android 构建 | ✅ `BUILD SUCCESSFUL`，APK 14.3 MB |
+| 源码量 | Kotlin **54 个文件 / 7764 行**（commonMain 37 / androidMain 9 / iosMain 8） |
+| Android 真机端到端 | ✅ TAS-AN00（Android 12）：拍照 → 双栏建议卡（含缩略图/分数/台词/参考线/警告）→ 展开滚动 → 历史入库，无 FATAL |
+| iOS — Kotlin 侧 | ✅ `linkDebugFrameworkIosArm64 --rerun-tasks` **BUILD SUCCESSFUL**（import 修复后） |
+| iOS — 出包 | ✅ `xcodebuild -sdk iphoneos ... build` **EXIT=0**，产出 `iosApp.app`（CMP 1.8.2 + `-Wl,-U` 兼容层） |
+| 端到端延迟 | ⚠️ 实测均值 **8.9s**（3 次：12.3 / 8.2 / 6.3s），**超标**：基线 ≤2.5s，网络占 99.8% |
+| 阻塞项 | 缺 **iPhone 真机**（iOS 相机链路需真机）；**采纳率无埋点**，无法测量 |
+
+> **核验命令**（完整记录见 `docs/04-Phase1实施记录.md` §17/§18）：
+> `./gradlew :composeApp:assembleDebug` · `./gradlew :composeApp:linkDebugFrameworkIosArm64 --rerun-tasks`
+> · `cd iosApp && xcodebuild -project iosApp.xcodeproj -scheme iosApp -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build -quiet`
+> · 真机拍照后 `adb logcat -d | grep 'AppState'` 看「完成：总 Xms（网络 Yms）」
 
 Phase 1 范围：**单张照片** → 拍照 → 双栏建议卡。
 Phase 2 目标：**30fps 视频流**实时取景建议（感知层接口已预留在 `commonMain`）。
@@ -243,7 +251,10 @@ interface PerceptionSource {
 - [x] 双栏建议卡 + 严格 JSON 提示词
 - [x] 远端模型完全可配置，9 类失败显式分类
 - [x] Debug 浮层（分段耗时 + P50/P99）
-- [ ] 真机验收：端到端延迟、建议采纳率
+- [x] 真机验收（功能面）：Android 拍照 → 双栏建议卡 → 历史闭环走通（2026-11-17，API Key 已配）
+- [x] iOS 出包：Xcode iphoneos 链接成功（supportIosModule 分支，2026-11-17 复测）
+- [ ] 端到端延迟达标：实测 8.9s vs 基线 2.5s（网络占 99.8%，需换模型/降图或改协议）
+- [ ] 建议采纳率：**无埋点**，无法测量（需先加埋点）
 - [ ] 拍照按 EXIF 真正转正（现在只传 `rotationDegrees`）
 - [ ] 上传前客户端下采样（现在依赖服务端 `detail=low`）
 
@@ -260,6 +271,11 @@ interface PerceptionSource {
 
 ## 已知限制
 
+- **main 分支 iOS 编译是坏的**：`feature/wangyayun/supportIosModule` 才是能出包的分支
+  （补了 §13 引入的 4 处 cinterop import + CMP 降到 1.8.2）。main 上
+  `linkDebugFrameworkIosArm64` 在 `compileKotlinIosArm64` 就失败；该分支尚未合回 main。
+- **端到端延迟超标（2026-11-17 实测）**：3 次 6.3~12.3s（均值 8.9s vs 基线 2.5s），
+  网络占 99.8%——瓶颈在云端模型调用，不在端侧（感知/编码/组装合计 < 15ms）。
 - **iOS 出包已打通，但依赖兼容层**：CMP 1.8.2 + Kotlin/Native 2.3.21 在 iOS 16.2 SDK 上
   仍引用两个 iOS 17 符号，靠 `Config.xcconfig` 的 `-Wl,-U` 动态查找完成链接；
   升级 SDK 后须移除该兼容层。详见 [`iosApp/README.md`](iosApp/README.md)。

@@ -8,3 +8,9 @@
 TEAM_ID =
 BUNDLE_ID = com.photoguide.iosApp
 APP_NAME = iosApp
+
+// Kotlin/Native 2.3.21 的平台库、Compose 1.8.2 的放大镜实现会引用两个 iOS 17+
+// 符号，而本机只有 iOS 16.2 SDK。让这两个符号走动态查找：iOS 16 上对应代码路径
+// 有内部降级分支（"UITextLoupeSession is not available"），不会真正调用到它们。
+// 升级到 Xcode 26 / iOS 26 SDK 后应删除这一行，让系统正常提供符号。
+OTHER_LDFLAGS = $(inherited) -Wl,-U,_OBJC_CLASS_$_UITextLoupeSession -Wl,-U,_UIAccessibilityTraitToggleButton

@@ -33,8 +33,12 @@ import platform.AVFoundation.AVCaptureVideoPreviewLayer
 import platform.AVFoundation.AVLayerVideoGravityResizeAspectFill
 import platform.AVFoundation.AVMediaTypeVideo
 import platform.AVFoundation.authorizationStatusForMediaType
+import platform.AVFoundation.defaultDeviceWithDeviceType
 import platform.AVFoundation.fileDataRepresentation
 import platform.AVFoundation.requestAccessForMediaType
+import platform.Foundation.create
+import platform.Foundation.timeIntervalSince1970
+import platform.Foundation.writeToFile
 import platform.CoreGraphics.CGRectMake
 import platform.Foundation.NSData
 import platform.Foundation.NSDate
@@ -172,8 +176,8 @@ internal class IosCaptureController : CaptureController {
     private fun deviceFor(facing: CameraFacing): AVCaptureDevice? =
         AVCaptureDevice.defaultDeviceWithDeviceType(
             AVCaptureDeviceTypeBuiltInWideAngleCamera,
-            if (facing == CameraFacing.BACK) AVCaptureDevicePositionBack else AVCaptureDevicePositionFront,
             AVMediaTypeVideo,
+            if (facing == CameraFacing.BACK) AVCaptureDevicePositionBack else AVCaptureDevicePositionFront,
         )
 
     private fun configure() {

@@ -19,16 +19,25 @@
 
 ## 当前状态
 
-**Phase 1 已开工并构建通过**（2026-10-14）。
+**Phase 1 功能闭环已跑通**：Android 真机端到端 + iOS 出包均已实测通过。
+下表基于 **`feature/wangyayun/supportIosModule` 分支、2026-11-17 15:30 后实测**
+（该分支把 CMP 降到 1.8.2 并补了 cinterop import；**main 分支仍编译不过**，见 §已知限制）。
 
-| 项 | 结果 |
+| 项 | 结果（本次实测） |
 |---|---|
-| Android 构建 | ✅ `BUILD SUCCESSFUL`，产物 `composeApp-debug.apk`（15.7 MB） |
-| 源码量 | Kotlin 36 个文件 / 2979 行 |
-| iOS — Kotlin 侧 | ✅ **已编译 + 链接通过**（`iosArm64` debug framework，250 MB） |
-| iOS — Xcode 工程 | ✅ 已生成（`.xcodeproj` + 共享 scheme）；**Swift 侧编译通过**，`import ComposeApp` 打通 |
-| iOS — 出包 | ❌ 卡在 **iOS SDK 版本**：本机 Xcode 14.2 只有 iOS 16.2 SDK，缺 CMP 1.11.1 直接引用的符号 |
-| 阻塞项 | 缺一台 Android / iPhone 真机、一个 DeepSeek API Key；iOS 出包需先升级 macOS + Xcode |
+| 当前分支 | `feature/wangyayun/supportIosModule`（CMP **1.8.2**；main 是 1.11.1） |
+| Android 构建 | ✅ `BUILD SUCCESSFUL`，APK 14.3 MB |
+| 源码量 | Kotlin **54 个文件 / 7764 行**（commonMain 37 / androidMain 9 / iosMain 8） |
+| Android 真机端到端 | ✅ TAS-AN00（Android 12）：拍照 → 双栏建议卡（含缩略图/分数/台词/参考线/警告）→ 展开滚动 → 历史入库，无 FATAL |
+| iOS — Kotlin 侧 | ✅ `linkDebugFrameworkIosArm64 --rerun-tasks` **BUILD SUCCESSFUL**（import 修复后） |
+| iOS — 出包 | ✅ `xcodebuild -sdk iphoneos ... build` **EXIT=0**，产出 `iosApp.app`（CMP 1.8.2 + `-Wl,-U` 兼容层） |
+| 端到端延迟 | ⚠️ 实测均值 **8.9s**（3 次：12.3 / 8.2 / 6.3s），**超标**：基线 ≤2.5s，网络占 99.8% |
+| 阻塞项 | 缺 **iPhone 真机**（iOS 相机链路需真机）；**采纳率无埋点**，无法测量 |
+
+> **核验命令**（完整记录见 `docs/04-Phase1实施记录.md` §17/§18）：
+> `./gradlew :composeApp:assembleDebug` · `./gradlew :composeApp:linkDebugFrameworkIosArm64 --rerun-tasks`
+> · `cd iosApp && xcodebuild -project iosApp.xcodeproj -scheme iosApp -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build -quiet`
+> · 真机拍照后 `adb logcat -d | grep 'AppState'` 看「完成：总 Xms（网络 Yms）」
 
 Phase 1 范围：**单张照片** → 拍照 → 双栏建议卡。
 Phase 2 目标：**30fps 视频流**实时取景建议（感知层接口已预留在 `commonMain`）。
@@ -49,7 +58,7 @@ AVFoundation，**帧通路不必绕一层自有插件桥**；而调参代码能�
 | 组件 | 版本 | 说明 |
 |---|---|---|
 | Kotlin | 2.3.21 | 取各库 kotlin-stdlib 依赖上界 |
-| Compose Multiplatform | 1.11.1 | 不用 1.12.x：它要求 compileSdk 37 |
+| Compose Multiplatform | 1.8.2 | 为兼容 Xcode 14.2 / iOS 16.2 SDK 从 1.11.1 降级；1.11.x 引用 iOS 26 符号 |
 | Ktor | 3.5.2 | HTTP 客户端（Android=OkHttp / iOS=Darwin） |
 | kotlinx-serialization | 1.10.0 | JSON |
 | AGP / Gradle | 8.11.1 / 8.13 | AGP 受 Android Studio 版本上限约束（见下） |
@@ -127,13 +136,15 @@ adb install -r composeApp/build/outputs/apk/debug/composeApp-debug.apk
 open iosApp/iosApp.xcodeproj     # 工程已生成，直接打开即可构建
 ```
 
-**必须 macOS + Xcode，而且 Xcode 版本有硬门槛。**
-Compose Multiplatform 1.11.1 要求 Xcode 16+（社区实测需 **Xcode 26 / iOS 26 SDK**，
-卡点是它直接引用了 `UIViewLayoutRegion` 这类新符号）。
+**必须 macOS + Xcode。** 当前 CMP 已降到 1.8.2，可在 Xcode 14.2 / iOS 16.2 SDK 上出包；
+Kotlin/Native 平台库仍引用两个 iOS 17 符号（`UITextLoupeSession`、
+`UIAccessibilityTraitToggleButton`），通过 `iosApp/Configuration/Config.xcconfig`
+中的 `-Wl,-U` 让它走动态查找，App 链接已验证通过。
 
-本机现状：Xcode 14.2 → iOS SDK 16.2。Kotlin 侧的 `ComposeApp.framework`
-能编译能链接，Swift 侧也能编过，但**最后把 App 与 framework 链到一起时会因缺符号失败**。
-完整报错原文、核验方法与结论见 [`iosApp/README.md`](iosApp/README.md)。
+运行仍需真机（相机能力），Intel 模拟器目标 `iosX64` 已恢复声明，
+待 Maven 网络稳定后可执行 `./gradlew :composeApp:linkDebugFrameworkIosX64`。
+升级 Xcode / Compose 时应移除 `Config.xcconfig` 里的 `-Wl,-U` 两行。
+细节见 [`iosApp/README.md`](iosApp/README.md)。
 
 ---
 
@@ -240,7 +251,10 @@ interface PerceptionSource {
 - [x] 双栏建议卡 + 严格 JSON 提示词
 - [x] 远端模型完全可配置，9 类失败显式分类
 - [x] Debug 浮层（分段耗时 + P50/P99）
-- [ ] 真机验收：端到端延迟、建议采纳率
+- [x] 真机验收（功能面）：Android 拍照 → 双栏建议卡 → 历史闭环走通（2026-11-17，API Key 已配）
+- [x] iOS 出包：Xcode iphoneos 链接成功（supportIosModule 分支，2026-11-17 复测）
+- [ ] 端到端延迟达标：实测 8.9s vs 基线 2.5s（网络占 99.8%，需换模型/降图或改协议）
+- [ ] 建议采纳率：**无埋点**，无法测量（需先加埋点）
 - [ ] 拍照按 EXIF 真正转正（现在只传 `rotationDegrees`）
 - [ ] 上传前客户端下采样（现在依赖服务端 `detail=low`）
 
@@ -257,14 +271,17 @@ interface PerceptionSource {
 
 ## 已知限制
 
-- **iOS 出包卡在 SDK 版本**：Kotlin 侧 `ComposeApp.framework` 已编译+链接通过，
-  Xcode 工程已生成、Swift 侧也已编译通过；但 iOS 16.2 SDK 缺 CMP 1.11.1 引用的符号
-  （`UIViewLayoutRegion` / `UITextSelectionDisplayInteraction` 等），App 链接失败。
-  需 Xcode 16+（实测需 Xcode 26 + iOS 26 SDK），而升级 Xcode 需先升级 macOS。
-  详见 [`iosApp/README.md`](iosApp/README.md)。
-- **Intel Mac 上没有可用的 iOS 模拟器目标**：CMP 1.11.1 起移除了 `iosX64`
-  （该版本不再发布 x86_64 产物），所以工程只声明 `iosArm64` + `iosSimulatorArm64`；
-  后者要在 Apple Silicon 上才能跑。
+- **main 分支 iOS 编译是坏的**：`feature/wangyayun/supportIosModule` 才是能出包的分支
+  （补了 §13 引入的 4 处 cinterop import + CMP 降到 1.8.2）。main 上
+  `linkDebugFrameworkIosArm64` 在 `compileKotlinIosArm64` 就失败；该分支尚未合回 main。
+- **端到端延迟超标（2026-11-17 实测）**：3 次 6.3~12.3s（均值 8.9s vs 基线 2.5s），
+  网络占 99.8%——瓶颈在云端模型调用，不在端侧（感知/编码/组装合计 < 15ms）。
+- **iOS 出包已打通，但依赖兼容层**：CMP 1.8.2 + Kotlin/Native 2.3.21 在 iOS 16.2 SDK 上
+  仍引用两个 iOS 17 符号，靠 `Config.xcconfig` 的 `-Wl,-U` 动态查找完成链接；
+  升级 SDK 后须移除该兼容层。详见 [`iosApp/README.md`](iosApp/README.md)。
+- **Intel Mac 模拟器目标已恢复并验证**（CMP 1.8.2 仍发布 `iosX64`）：
+  `linkDebugFrameworkIosX64` 成功，App 已在 iPhone 14 模拟器启动；
+  模拟器无真实相机，取景/拍照链路仍需真机。`iosSimulatorArm64` 需 Apple Silicon。
 - **模拟器无真实相机**：AVD 只能跑通 UI，采集与端到端延迟必须真机。
 - **Android 部分机型不支持"预览 + 图像分析"并行**，Phase 2 需做启动时能力探测。
 - **感知层尚未接入**：Phase 1 的 `NoPerception` 不产生任何检测结果，

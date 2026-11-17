@@ -498,6 +498,23 @@ grep -rl UITextSelectionDisplayInteraction "$H" | wc -l   #  0
 | `iosApp/scripts/compile-kotlin-framework.sh` | ✅ 新建 |
 | `iosApp/README.md` | ✅ 重写（原版基于"本机 Windows 无 Xcode"的前提，已不成立） |
 
+### 7.6 2026-11-17 追加：降级 CMP 打通 iOS 16.2 出包
+
+§7.4 的阻塞已通过**降级**绕开，不需要升级 macOS/Xcode：
+
+| 步骤 | 结果 |
+|---|---|
+| CMP 1.11.1 → 1.9.3 | `UIViewLayoutRegion` / `UITextSelectionDisplayInteraction` / `UITraitUserInterfaceStyle` 消失；仍缺 `UITextLoupeSession` / `UIAccessibilityTraitToggleButton`（iOS 17+） |
+| CMP 1.9.3 → 1.8.2 | 缺符号不再减少，确认这两个来自 Kotlin/Native 2.3.21 平台库，不是 Compose 引入 |
+| `Config.xcconfig` 加 `-Wl,-U` | 两个符号走动态查找，App 链接通过（Xcode 14.2 + iOS 16.2 SDK） |
+| `iosX64()` 恢复 | CMP 1.8.2 仍发布 x86_64 变体；framework 编译成功，App 已在 iPhone 14 模拟器启动，相机权限弹窗正常 |
+
+降级后 `CaptureController.ios.kt` 需补 4 个包级 import（`defaultDeviceWithDeviceType` /
+`timeIntervalSince1970` / `writeToFile` / `create`），并交换 `defaultDeviceWithDeviceType`
+的 `mediaType` 与 `position` 实参顺序——Kotlin/Native 的 ObjC 映射在这些版本下不同。
+
+升级 Xcode 26 / iOS 26 SDK 后，应删掉 `Config.xcconfig` 的 `-Wl,-U` 两行。
+
 
 ---
 
@@ -509,8 +526,7 @@ grep -rl UITextSelectionDisplayInteraction "$H" | wc -l   #  0
    端到端延迟，都必须真机才能验。模拟器可跑通 UI，但没有真实相机。
 2. **一个 DeepSeek API Key** —— 填进设置页即可跑通端到端。
    （也可以先不填，App 会明确提示"还没配置 API Key"而不是崩掉。）
-3. **iOS 出包需要先升级 macOS + Xcode**（§7.4）—— Kotlin 侧已经全绿，
-   缺的是 iOS SDK 里的符号。这是一次系统级动作，不是代码问题。
+3. **一台 iPhone 真机** —— iOS App 已能链接出包（§7.6），但相机链路必须真机验证。
 
 **代码侧待办（不阻塞）**
 
@@ -993,3 +1009,135 @@ id 用 `maxOf(nowEpochMs(), 上一条 id + 1)` 保证严格递增——LazyColum
 
 **验证**（真机 TAS-AN00）：点缩略图 → 全屏预览（✕ 在状态栏下方、
 底部说明行清晰）；✕ → 回列表（dump 确认浮层已关、2 条缩略图仍可点）。
+
+---
+
+## 17. Phase 1 验收核验（2026-11-17，README 声明逐条复核）
+
+**动机**：README「当前状态」表写于 2026-10-14，其中"源码量 / iOS 编译链接 / 缺真机"
+三处已过期——期间合入了 §13~§16 的功能，且本机连上了真机。按"未验证/已验证如实写"
+的原则，逐条复跑并校正 README。
+
+### 17.1 构建类
+
+| 声明 | 核验命令 | 实测结果 |
+|---|---|---|
+| Android `BUILD SUCCESSFUL` | `export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"; ./gradlew :composeApp:assembleDebug` | ✅ BUILD SUCCESSFUL in 2m35s；APK 14,276,492 B（14.3 MB） |
+| 源码 36 文件 / 2979 行 | `find composeApp/src -name '*.kt' \| wc -l` | ❌ 已过期：现 **54 文件 / 7764 行**（commonMain 37/6545、androidMain 9/647、iosMain 8/572）。README 已改 |
+| iOS framework 编译+链接通过 | `./gradlew :composeApp:linkDebugFrameworkIosArm64 --rerun-tasks` | ❌ **当前 main 失败**：`compileKotlinIosArm64` 4 处 unresolved reference（见 17.3）。README 已改 |
+
+### 17.2 Android 真机功能面（TAS-AN00 / Android 12 / 1080×2340）
+
+前提：旧 APK 与新签名不一致，`adb uninstall com.photoguide` 后重装；`pm grant ... CAMERA`。
+设备未配 API Key（`shared_prefs/photo_guide.xml` 只有两条内置端点、无 apiKey）。
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| 相机取景 | ✅ | `verify_01_camera.png`：真实画面 + 三分线参考线，顶栏「相机就绪·后置」「构图·三分线」，无黑屏 |
+| 拍照入库 | ✅ | logcat `PhotoGuideGallery: 已存入相册：DCIM/PhotoGuide (350891B)`；媒体库 `relative_path=DCIM/PhotoGuide/` 计数 2→3 |
+| 快门换镜手势 | ✅ | 从快门中心左滑→「相机就绪·前置」，右滑→回后置。⚠️ 两次中途失败是 adb swipe 起点不在快门中心（注入姿势），非代码问题 |
+| 降级不静默 | ✅ | `verify_02_not_configured.png`：红色横幅「⚠ NOT_CONFIGURED / 端点「DeepSeek」还没填全…点右上角设置补一下」，无崩溃无假成功 |
+| 调试浮层 | ✅ | `verify_03_debug.png`：`phase=FAILED` / `perception=none` / 分段耗时 / 最近延迟趋势 / 提示词 1398+1006 字 / 预演 |
+| 设置页 | ✅ | 端点卡片（DeepSeek 生效中 / Claude）、拍摄记录入口、Base URL/模型名/API Key 三个输入框均在层级内；扫描到的字段可正常唤起键盘 |
+| 历史入口 | ✅ | 设置→「拍摄记录」→「0/20 条 · 只存本机」+ 空态文案完整 |
+| FATAL | ✅ 无 | `adb logcat -d \| grep -i 'FATAL EXCEPTION'` 无 App 崩溃（仅华为 NetworkKit 的系统级 WARN） |
+
+**工具陈旧问题**：`python3 tools/settings_keyboard_probe.py 3` 只跑到 2/2 项就中止——
+脚本写于 2026-10-20，靠EditText 在层级里的相对位置定位第 3 个字段；§16 往设置页顶部
+插入「拍摄记录」卡片后整体下移，脚本"点空白后再找输入框"的启发式失效。
+手工核验键盘弹出/收起正常（`mInputShown` true/false 可切换）。**这是测试脚本要更新，
+不是 App 回归**——已把结论写进 README，避免被误读成功能坏掉。
+
+### 17.3 iOS 阻塞点的真实状态（比 README 旧描述更靠前）
+
+旧的"卡在 iOS 16.2 SDK 缺符号"是 §13 之前的状态。**当前 main 在 Kotlin 编译期就挂**：
+
+```
+e: CaptureController.ios.kt:173:25 Unresolved reference 'defaultDeviceWithDeviceType'
+e: CaptureController.ios.kt:361:72 Unresolved reference 'timeIntervalSince1970'
+e: CaptureController.ios.kt:362:23 Unresolved reference 'writeToFile'
+e: CaptureController.ios.kt:390:16 Unresolved reference 'create'
+```
+
+根因是 cinterop 签名规律（本文件老教训）：ObjC category 方法在 Kotlin/Native metadata 里是
+**包级扩展函数**，必须 import 才能用。`xcodebuild ... -sdk iphoneos ... build` 同样在
+Run Script 的 Gradle 步骤失败（EXIT=65），还没走到链接。
+
+修复已存在于未合并分支 `feature/wangyayun/supportIosModule`（4ad9a81）：
+补 4 个 import（`platform.AVFoundation.defaultDeviceWithDeviceType` /
+`platform.Foundation.timeIntervalSince1970` / `.writeToFile` / `.create`），
+且 `defaultDeviceWithDeviceType` 的参数顺序需 mediaType 在前、position 在后；
+该分支还把 CMP 降到 1.8.2 并在 `Config.xcconfig` 加 `-Wl,-U` 两个符号兼容层。
+**本次未在该分支复跑**，所以 README 里标"声称、未复验"，不冒充已验证。
+
+### 17.4 仍未验收（诚实的缺口）
+
+- **端到端延迟 / 建议采纳率**：需 DeepSeek API Key；设备未配 Key，且代码里
+  `grep -rniE '采纳|adopt'` 无任何埋点——采纳率这一项目前**连测量手段都没有**。
+  §14.5 声称的双栏建议卡端到端截图 `p1_hint.png` / `p8_preview2.png` 现已不在
+  `build/shots/`（build 被清理过），本次只走到降级横幅，未复现真实 LLM 建议卡。
+- **iPhone 真机**：本机只有 Android 真机；iOS 相机链路（AVCaptureSession）未真机跑过。
+- **键盘 probe 自动化**：见 17.2，脚本需按新设置页布局重做定位，暂以手工核验替代。
+
+### 17.5 产物
+
+`build/shots/verify_01_camera.png`（取景）、`verify_02_not_configured.png`（降级横幅）、
+`verify_03_debug.png`（调试浮层），均在 `.gitignore` 的 `build/` 下，不入库。
+
+---
+
+## 18. 复验：API Key 就位 + 切到可出包分支（2026-11-17 15:30 后）
+
+**背景**：§17 之后用户配好 DeepSeek API Key，并切到 `feature/wangyayun/supportIosModule`
+（CMP 1.8.2 + cinterop import 修复 + `-Wl,-U` 兼容层）。重新验证 §17 里标"失败/未验"的项。
+
+### 18.1 iOS 出包：由"失败"翻为"通过"
+
+| 核验命令 | §17（main / CMP 1.11.1） | 本次（supportIosModule / 1.8.2） |
+|---|---|---|
+| `./gradlew :composeApp:linkDebugFrameworkIosArm64 --rerun-tasks` | ❌ `compileKotlinIosArm64` 4 处 unresolved | ✅ **BUILD SUCCESSFUL in 2m19s** |
+| `xcodebuild -project iosApp.xcodeproj -scheme iosApp -configuration Debug -sdk iphoneos -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build -quiet` | ❌ EXIT=65（同一处 Kotlin 编译失败） | ✅ **EXIT=0**，产出 `DerivedData/.../Debug-iphoneos/iosApp.app` |
+
+根因确认：`CaptureController.ios.kt` 已补 4 个包级扩展 import
+（`defaultDeviceWithDeviceType` / `Foundation.create` / `timeIntervalSince1970` / `writeToFile`），
+且 `defaultDeviceWithDeviceType` 参数顺序调整为 mediaType 在前。
+**结论：iOS 出包阻塞项已解除，但成果在未合并分支上——main 仍需合分支才成立。**
+
+### 18.2 Android 真机端到端：真实 LLM 建议卡已复现
+
+设备 prefs 恢复方式（避免卸载丢失 API Key）：`adb shell run-as com.photoguide cat shared_prefs/photo_guide.xml`
+备份 → 卸载/装机 → 首次启动生成目录 → `adb push` 到 `/data/local/tmp` → `run-as ... cp` 回
+`shared_prefs/photo_guide.xml` → 重启。（注意：`run-as` 读不到 /sdcard，必须走 /data/local/tmp。）
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| 拍照 → 建议卡 | ✅ | `verify_e2e_hint.png`：缩略图 + 分数 35 + 标题「画面无人，底边虚影抢镜要移出」+ 首行 + 机位4/要点3/问题3/注意3 + ⚠ 警告 + 参考线卡 |
+| 展开态双栏 | ✅ | `verify_e2e_expanded.png`：「你（摄影师）」与「画面要点」两栏并排；`verify_e2e_expanded_scrolled.png` 为滚动后内容，第 3 条才露出 |
+| 卡片内滚动 | ✅ |  swipe 后新条目出现（"往右挪半步…" / "白瓷砖反光偏冷…"），证明正文可滚、不是被裁掉 |
+| 历史入库 | ✅ | logcat `历史 +1：共 2/20 条（缩略图 3KB）` |
+| Debug 浮层 | ✅ | `verify_e2e_debug.png`：`phase=DONE`、分段耗时 0/7/0/6248/6255ms、`P50 8206ms ｜ P99 8206ms` |
+| FATAL | ✅ 无 | 全程 `grep 'FATAL EXCEPTION'` 无命中 |
+
+### 18.3 端到端延迟：实测出来，但**不达标**
+
+AppState 成功日志格式：`完成：总 Xms（网络 Yms） | 感知=a, 编码=b, 组装=c, 模型=d`。三次连拍：
+
+| # | 总 | 网络 | 感知 | 编码 | 组装 | 模型 |
+|---|---|---|---|---|---|---|
+| 1 | 12275ms | 12246ms | 3ms | 9ms | 1ms | 12260ms |
+| 2 | 8206ms | 8185ms | 1ms | 7ms | 0ms | 8196ms |
+| 3 | 6257ms | 6243ms | 0ms | 7ms | 0ms | 6248ms |
+
+- 均值 **8913ms**，P50 8206ms，最大 12275ms；对比 P1-M1 基线 **≤2500ms，超标约 3.6 倍**；
+- **网络占 99.8%**，端侧三段合计 < 15ms —— 瓶颈完全在 DeepSeek 视觉模型的响应，
+  不是采集/编码/提示词。要达标得从模型选择 / 图片尺寸 / 流式返回或换协议入手，
+  属于独立优化动作，不是 bug；
+- Debug 浮层的 P50/P99 与趋势图这次拿到了真实样本（不再显示"（无样本）"）。
+
+### 18.4 仍未解决
+
+- **建议采纳率**：`grep -rniE '采纳|adopt|accepted' composeApp/src` 仍无任何命中——
+  埋点不存在，这一项**不是"没测"，是"测不了"**，需先实现埋点（主方案 §M2 交付物）。
+- **iPhone 真机**：iOS 只验到链接成功，AVCaptureSession 真机链路未跑（本机无 iPhone）。
+- **键盘 probe 脚本**：同 §17.2，仍因设置页布局变更失效，手工核验键盘正常，脚本待更新。
+- **main 分支**：iOS 编译失败依旧；需把 supportIosModule 合回 main 才能让 README 主表成立。

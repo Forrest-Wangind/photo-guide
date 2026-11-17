@@ -1,6 +1,7 @@
 package com.photoguide
 
 import androidx.compose.ui.window.ComposeUIViewController
+import com.photoguide.ui.App
 import platform.UIKit.UIViewController
 
 /**

@@ -8,11 +8,19 @@ local.properties
 captures/
 .DS_Store
 
-# iOS
+# iOS / Xcode
 iosApp/Pods/
-iosApp/*.xcworkspace/xcuserdata/
-iosApp/*.xcodeproj/xcuserdata/
+# Xcode 的个人/机器级状态：断点、窗口布局、最近打开的文件、DerivedData 路径——
+# 提交它只会让每个人的 Xcode 互相打架。共享 scheme 走 xcshareddata/，不受此影响。
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+DerivedData/
+*.ipa
+*.dSYM.zip
+
 *.hprof
+
 
 # 不提交密钥
 secrets.properties

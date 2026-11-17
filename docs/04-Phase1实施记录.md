@@ -498,6 +498,23 @@ grep -rl UITextSelectionDisplayInteraction "$H" | wc -l   #  0
 | `iosApp/scripts/compile-kotlin-framework.sh` | ✅ 新建 |
 | `iosApp/README.md` | ✅ 重写（原版基于"本机 Windows 无 Xcode"的前提，已不成立） |
 
+### 7.6 2026-11-17 追加：降级 CMP 打通 iOS 16.2 出包
+
+§7.4 的阻塞已通过**降级**绕开，不需要升级 macOS/Xcode：
+
+| 步骤 | 结果 |
+|---|---|
+| CMP 1.11.1 → 1.9.3 | `UIViewLayoutRegion` / `UITextSelectionDisplayInteraction` / `UITraitUserInterfaceStyle` 消失；仍缺 `UITextLoupeSession` / `UIAccessibilityTraitToggleButton`（iOS 17+） |
+| CMP 1.9.3 → 1.8.2 | 缺符号不再减少，确认这两个来自 Kotlin/Native 2.3.21 平台库，不是 Compose 引入 |
+| `Config.xcconfig` 加 `-Wl,-U` | 两个符号走动态查找，App 链接通过（Xcode 14.2 + iOS 16.2 SDK） |
+| `iosX64()` 恢复 | CMP 1.8.2 仍发布 x86_64 变体；framework 编译成功，App 已在 iPhone 14 模拟器启动，相机权限弹窗正常 |
+
+降级后 `CaptureController.ios.kt` 需补 4 个包级 import（`defaultDeviceWithDeviceType` /
+`timeIntervalSince1970` / `writeToFile` / `create`），并交换 `defaultDeviceWithDeviceType`
+的 `mediaType` 与 `position` 实参顺序——Kotlin/Native 的 ObjC 映射在这些版本下不同。
+
+升级 Xcode 26 / iOS 26 SDK 后，应删掉 `Config.xcconfig` 的 `-Wl,-U` 两行。
+
 
 ---
 
@@ -509,8 +526,7 @@ grep -rl UITextSelectionDisplayInteraction "$H" | wc -l   #  0
    端到端延迟，都必须真机才能验。模拟器可跑通 UI，但没有真实相机。
 2. **一个 DeepSeek API Key** —— 填进设置页即可跑通端到端。
    （也可以先不填，App 会明确提示"还没配置 API Key"而不是崩掉。）
-3. **iOS 出包需要先升级 macOS + Xcode**（§7.4）—— Kotlin 侧已经全绿，
-   缺的是 iOS SDK 里的符号。这是一次系统级动作，不是代码问题。
+3. **一台 iPhone 真机** —— iOS App 已能链接出包（§7.6），但相机链路必须真机验证。
 
 **代码侧待办（不阻塞）**
 

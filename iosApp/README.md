@@ -137,45 +137,43 @@ Command PhaseScriptExecution failed with a nonzero exit code
 
 ---
 
-## Xcode 版本是硬门槛（本机实测踩到）
+## iOS 16.2 SDK 兼容处理（CMP 1.8.2）
 
-**结论：Xcode 14.2（iOS SDK 16.2）不够用——App 的最后一步链接会失败。**
+CMP 1.11.1 引用了 iOS 26 的 `UIViewLayoutRegion`，iOS 16.2 SDK 无法链接。
+把 CMP 降到 **1.8.2** 后，用 `nm -u` 检查 framework，缺符号从 5 个减到 2 个：
 
-Kotlin 侧完全正常：`ComposeApp.framework` 能编译、能链接。
-卡在把 App 与 framework 链到一起时：
+| 符号 | 引入方 | 最低 iOS | 1.8.2 后 |
+|---|---|---|---|
+| `UIViewLayoutRegion` | CMP 1.11.x | 26.0 | ✅ 消失 |
+| `UITextSelectionDisplayInteraction` | CMP 1.11.x | 17.0 | ✅ 消失 |
+| `UITraitUserInterfaceStyle` | CMP 1.11.x | 17.0 | ✅ 消失 |
+| `UITextLoupeSession` | Kotlin/Native 平台库 + Compose 放大镜 | 17.0 | ⚠️ 仍在 |
+| `UIAccessibilityTraitToggleButton` | Kotlin/Native UIKit 平台库 | 17.0 | ⚠️ 仍在 |
+
+剩下两个来自 **Kotlin/Native 2.3.21 的平台库**，不是降级 Compose 能消掉的。
+在 `Configuration/Config.xcconfig` 里让它们走动态查找：
 
 ```
-Undefined symbols for architecture arm64:
-  "_OBJC_CLASS_$_UITextLoupeSession"                in ComposeApp(CMPTextLoupeSession.o)
-  "_OBJC_CLASS_$_UITextSelectionDisplayInteraction" in ComposeApp(CMPEditMenuView.o)
-  "_OBJC_CLASS_$_UITraitUserInterfaceStyle"         in ComposeApp(CMPView.o)
-  "_OBJC_CLASS_$_UIViewLayoutRegion"                in ComposeApp(CMPLayoutRegion.o)
-  "_UIAccessibilityTraitToggleButton"               in ComposeApp(...UIKit-cache.a.o)
+OTHER_LDFLAGS = $(inherited) -Wl,-U,_OBJC_CLASS_$_UITextLoupeSession -Wl,-U,_UIAccessibilityTraitToggleButton
 ```
 
-这几个符号是 Compose Multiplatform 1.11.1 的 iOS 实现**直接引用**的，
-而它们在 iOS 16.2 SDK 里根本不存在。核验方式（关键是带阳性对照，否则测不出真假）：
+Compose 内部对放大镜有降级分支（字符串 `UITextLoupeSession is not available`），
+iOS 16 上不会真正调用；App 链接已验证通过：
 
 ```sh
-SDK=/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS16.2.sdk
-H="$SDK/System/Library/Frameworks/UIKit.framework/Headers"
-grep -rl UITextField                       "$H" | wc -l   # 11  ← 阳性对照，说明测法有效
-grep -rl UIViewLayoutRegion                "$H" | wc -l   #  0
-grep -rl UITextSelectionDisplayInteraction "$H" | wc -l   #  0
+xcodebuild -project iosApp.xcodeproj -scheme iosApp -configuration Debug \
+  -sdk iphoneos -destination 'generic/platform=iOS' \
+  CODE_SIGNING_ALLOWED=NO build -quiet     # BUILD SUCCEEDED
 ```
 
-（顺带记一笔：`.tbd` 文件里**不逐条列 ObjC 类符号**，拿它当判据会得出"UIView 也不存在"
-这种明显错误的结果。头文件才是有效判据。）
+**升级到 Xcode 26 / iOS 26 SDK 后必须删掉这两行 `-Wl,-U`**，让系统正常提供符号。
 
-| 依赖 | 要求 | 本机 |
-|---|---|---|
-| Xcode | **16+**；社区实测 CMP 1.11.1 需要 **Xcode 26 / iOS 26 SDK**，卡点正是 `UIViewLayoutRegion` | **14.2** ❌ |
-| iOS SDK | 上述符号必须存在 | **16.2** ❌ |
-| macOS | 装得上满足要求的 Xcode（Xcode 15 起就要求 macOS 13.5+，16 要求 14.5+） | **12.7.6** (Monterey) ❌ |
+核验缺符号的方法（阳性对照不能省）：
 
-> **升级 Xcode 需要先升级 macOS**，所以这不是"装个软件"的事，而是一次系统级动作。
-> 在这台机器上 Android 侧不受任何影响；iOS 侧目前只能验收到"framework 编出来"这一步，
-> 剩下的"App 链起来 → 真机跑起来"必须在升级后的环境里做。
+```sh
+F=composeApp/build/bin/iosArm64/debugFramework/ComposeApp.framework/ComposeApp
+nm -u "$F" | grep -E 'UIViewLayoutRegion|UITextLoupeSession|UIAccessibilityTraitToggleButton'
+```
 
 ---
 
@@ -186,17 +184,50 @@ grep -rl UITextSelectionDisplayInteraction "$H" | wc -l   #  0
 3. 首次运行后到「设置 → 隐私与安全性 → 相机」确认权限已授予。
    `Info.plist` 里已有 `NSCameraUsageDescription`，缺了它调用 `AVCaptureDevice` 会**直接崩溃**而非弹权限框。
 
+> 本机当前没有连接 iPhone，因此只验证到“App 链接成功”，尚未在真机上启动。
+
 ---
 
-## 模拟器为什么也不能用
+## 模拟器
 
-`sdk iphonesimulator` 在 Intel Mac 上对应 `iosX64`，而 **Compose Multiplatform 1.11.1
-已经不再发布 `iosX64` 产物**（该版本起移除了 Apple x86_64 目标），
-所以工程里的 iOS target 只声明了 `iosArm64` 与 `iosSimulatorArm64`。
+CMP 1.8.2 仍发布 `iosX64`，所以 `composeApp/build.gradle.kts` 已恢复三个 iOS target
+（`iosX64` / `iosArm64` / `iosSimulatorArm64`）。已验证：
 
-- Intel Mac 想用模拟器 → **没有可用目标**（模拟器需要 iosX64）。
-- Apple Silicon 用 `iosSimulatorArm64` 可以，但模拟器**没有真实摄像头**，
-  本 App 的核心链路（取景 → 拍照）依然必须真机。
+```sh
+./gradlew :composeApp:linkDebugFrameworkIosX64
+xcodebuild -project iosApp.xcodeproj -scheme iosApp -configuration Debug \
+  -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 14' \
+  CODE_SIGNING_ALLOWED=NO build
+xcrun simctl install booted <DerivedData>/Debug-iphonesimulator/iosApp.app
+xcrun simctl launch booted com.photoguide.iosApp
+```
+
+App 已在 iPhone 14 模拟器启动成功，主界面（顶栏、构图参考线、意图面板、快门）完整显示。
+注意：模拟器**没有真实摄像头**，顶栏会如实显示「相机不可用」，快门禁用 ——
+本 App 的核心链路（取景 → 拍照）依然必须真机。
+
+### 启动时 SIGABRT：Info.plist 缺 `CADisableMinimumFrameDurationOnPhone`
+
+第一次在模拟器跑起来时，App 启动约 1.5 秒后闪退，控制台原文：
+
+```
+Uncaught Kotlin exception: kotlin.IllegalStateException:
+  `Info.plist` doesn't have a valid `CADisableMinimumFrameDurationOnPhone` entry...
+com.photoguide.iosApp: ... (signal SIGABRT)
+```
+
+这是 Compose Multiplatform 1.8.x 引入的**启动期强校验**（`PlistSanityCheck`），
+要求 App 显式声明不禁用高刷新率；缺这项直接抛异常，不是相机/代码逻辑问题。
+修法：在 `iosApp/Info.plist` 加
+
+```xml
+<key>CADisableMinimumFrameDurationOnPhone</key>
+<true/>
+```
+
+> 排查方法：`xcrun simctl launch --console booted com.photoguide.iosApp` 会把
+> Kotlin/Native 的 `Uncaught Kotlin exception` 直接打到终端 —— 比翻系统日志快得多。
+> 配置改完重新 `xcodebuild -sdk iphonesimulator ... build` + `simctl install` 即可，无需重编 framework。
 
 ---
 
@@ -210,8 +241,8 @@ grep -rl UITextSelectionDisplayInteraction "$H" | wc -l   #  0
 | `composeApp/src/iosMain/.../capture/CaptureController.ios.kt` | ✅ 已编译通过（AVCaptureSession + AVCapturePhotoOutput） |
 | `iosApp/iosApp/*.swift` / `Info.plist` | ✅ Swift 编译通过（`import ComposeApp` 打通） |
 | `iosApp/iosApp.xcodeproj` | ✅ 已生成，`xcodebuild -list` / `-showBuildSettings` 均正常 |
-| `ComposeApp.framework`（iosArm64） | ✅ 编译 + 链接通过（250 MB，debug 静态库） |
-| **App 链接（Swift + framework → .app）** | ❌ **被 iOS SDK 版本卡住**，见「Xcode 版本是硬门槛」 |
+| `ComposeApp.framework`（iosArm64） | ✅ 编译 + 链接通过（211 MB，debug 静态库，CMP 1.8.2） |
+| **App 链接（Swift + framework → .app）** | ✅ 链接通过（iOS 16.2 SDK + `-Wl,-U` 兼容层，见上） |
 
 ### 首次编译时修掉的两处 cinterop 问题
 

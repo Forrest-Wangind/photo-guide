@@ -16,6 +16,10 @@ plugins {
  * 无条件声明会让 Windows 上的 `assembleDebug` 也去配置 iosMain 的元数据编译而失败。
  * 用一个显式判断把它挡掉，保证"同一份仓库：Windows 出 Android，macOS 出双端"。
  * 源码始终留在 src/iosMain 下，切到 Mac 即可编译。
+ *
+ * Compose Multiplatform 1.9.3 仍发布 iosX64（Intel 模拟器）变体，
+ * 所以本机（Intel Mac + Xcode 14.2）可以同时编译真机与模拟器 framework。
+ * 1.11.x 起才移除该目标；若再升回去，必须同步删掉 iosX64()。
  */
 val isMacOs = System.getProperty("os.name").startsWith("Mac", ignoreCase = true)
 
@@ -29,22 +33,16 @@ kotlin {
 
     if (isMacOs) {
         /**
-         * 只声明 arm64 两个 target，**刻意不含 iosX64**。
+         * Compose Multiplatform 1.9.3 仍发布 iosX64（Intel 模拟器）变体，
+         * 所以这里把三个 target 都声明回来：
+         *   ✅ iosX64             → Intel Mac 模拟器，可直接运行 UI（相机功能不可用）
+         *   ✅ iosArm64           → 真机（相机功能必须真机）
+         *   ⚠️ iosSimulatorArm64 → Apple Silicon 模拟器用，本机跑不了
          *
-         * 原因不是"用不上"，是"用不了"：Compose Multiplatform 1.11.1 已不再发布
-         * iosX64（Intel 模拟器）产物。Gradle 报的原文是
-         * `No matching variant of org.jetbrains.compose.ui:ui:1.11.1 was found`，
-         * 该依赖发布的变体里只有 iosArm64 / iosSimulatorArm64，没有 ios_x64。
-         *
-         * 声明 iosX64 的后果是每次构建都刷屏一整页 KMP Dependencies Resolution Failure，
-         * 却永远编不出东西来——所以直接不声明，把"不支持"这件事写在编译期。
-         *
-         * 对本机（Intel Mac + Xcode 14.2）意味着：
-         *   ✅ iosArm64          → 真机，唯一能真正跑起来的目标（相机本来也必须真机）
-         *   ⚠️ iosSimulatorArm64 → 能编，但 Intel Mac 上跑不了（模拟器只能 iosX64，而它没了）
-         * 想用模拟器：换 Apple Silicon 机器，用 iosSimulatorArm64。
+         * 注意：若把 Compose Multiplatform 升回 1.11.x，必须删掉 iosX64()——
+         * 该版本起所有模块都不再发布 x86_64 变体。
          */
-        listOf(iosArm64(), iosSimulatorArm64()).forEach { target ->
+        listOf(iosX64(), iosArm64(), iosSimulatorArm64()).forEach { target ->
             target.binaries.framework {
                 baseName = "ComposeApp"
                 isStatic = true
